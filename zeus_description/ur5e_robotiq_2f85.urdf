@@ -1,0 +1,418 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="ur5e_robotiq_85">
+
+  <material name="UR5eMetal">
+    <color rgba="0.7 0.7 0.7 1.0" />
+  </material>
+
+  <material name="RobotiqBlack">
+    <color rgba="0.12 0.12 0.12 1.0" />
+  </material>
+  <link name="world" />
+  <joint name="world_joint" type="fixed">
+    <parent link="world" />
+    <child link="base_link" />
+    <origin xyz="0 0 0" rpy="0 0 3.14159126" />
+  </joint>
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 3.14159265359"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/visual/base.dae" />
+      </geometry>
+      <material name="UR5eMetal" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 3.14159265359"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/collision/base.stl" />
+      </geometry>
+    </collision>
+    </link>
+
+  <link name="shoulder_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 3.14159265359"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/visual/shoulder.dae" />
+      </geometry>
+      <material name="UR5eMetal" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 3.14159265359"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/collision/shoulder.stl" />
+      </geometry>
+    </collision>
+    </link>
+
+  <joint name="shoulder_pan_joint" type="revolute">
+    <parent link="base_link" />
+    <child link="shoulder_link" />
+    <origin xyz="0 0 0.1625" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="150.0" velocity="3.15" />
+  </joint>
+
+  <link name="upper_arm_link">
+    <visual>
+      <origin xyz="0 0 0.138" rpy="1.5707963267948966 0 -1.5707963267948966"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/visual/upperarm.dae" />
+      </geometry>
+      <material name="UR5eMetal" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.138" rpy="1.5707963267948966 0 -1.5707963267948966"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/collision/upperarm.stl" />
+      </geometry>
+    </collision>
+    </link>
+
+  <joint name="shoulder_lift_joint" type="revolute">
+    <parent link="shoulder_link" />
+    <child link="upper_arm_link" />
+    <origin xyz="0 0 0" rpy="1.57079632679 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="150.0" velocity="3.15" />
+  </joint>
+
+  <link name="forearm_link">
+    <visual>
+      <origin xyz="0 0 0.007" rpy="1.5707963267948966 0 -1.5707963267948966"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/visual/forearm.dae" />
+      </geometry>
+      <material name="UR5eMetal" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.007" rpy="1.5707963267948966 0 -1.5707963267948966"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/collision/forearm.stl" />
+      </geometry>
+    </collision>
+    </link>
+
+  <joint name="elbow_joint" type="revolute">
+    <parent link="upper_arm_link" />
+    <child link="forearm_link" />
+    <origin xyz="-0.425 0 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="150.0" velocity="3.15" />
+  </joint>
+
+  <link name="wrist_1_link">
+    <visual>
+      <origin xyz="0 0 -0.127" rpy="1.5707963267948966 0 0"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/visual/wrist1.dae" />
+      </geometry>
+      <material name="UR5eMetal" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.127" rpy="1.5707963267948966 0 0"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/collision/wrist1.stl" />
+      </geometry>
+    </collision>
+    </link>
+
+  <joint name="wrist_1_joint" type="revolute">
+    <parent link="forearm_link" />
+    <child link="wrist_1_link" />
+    <origin xyz="-0.3922 0 0.1333" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="28.0" velocity="3.2" />
+  </joint>
+
+  <link name="wrist_2_link">
+    <visual>
+      <origin xyz="0 0 -0.0997" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/visual/wrist2.dae" />
+      </geometry>
+      <material name="UR5eMetal" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.0997" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/collision/wrist2.stl" />
+      </geometry>
+    </collision>
+    </link>
+
+  <joint name="wrist_2_joint" type="revolute">
+    <parent link="wrist_1_link" />
+    <child link="wrist_2_link" />
+    <origin xyz="0 -0.0997 0" rpy="1.57079632679 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="28.0" velocity="3.2" />
+  </joint>
+
+  <link name="wrist_3_link">
+    <visual>
+      <origin xyz="0 0 -0.0989" rpy="1.5707963267948966 0 0"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/visual/wrist3.dae" />
+      </geometry>
+      <material name="UR5eMetal" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.0989" rpy="1.5707963267948966 0 0"/>
+      <geometry>
+        <mesh filename="meshes/ur5e/collision/wrist3.stl" />
+      </geometry>
+    </collision>
+    </link>
+
+  <joint name="wrist_3_joint" type="revolute">
+    <parent link="wrist_2_link" />
+    <child link="wrist_3_link" />
+    <origin xyz="0 0.0996 0" rpy="1.57079632679 3.14159265359 3.14159265359" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="28.0" velocity="3.2" />
+  </joint>
+
+  <link name="flange" />
+
+  <joint name="wrist_3-flange" type="fixed">
+    <parent link="wrist_3_link" />
+    <child link="flange" />
+    <origin xyz="0 0 0" rpy="0 -1.57079632679 -1.57079632679" />
+  </joint>
+
+  <link name="tool0" />
+
+  <joint name="flange-tool0" type="fixed">
+    <parent link="flange" />
+    <child link="tool0" />
+    <origin xyz="0 0 0" rpy="1.57079632679 0 1.57079632679" />
+  </joint>
+
+  <link name="robotiq_coupler">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/robotiq_85_coupler.stl" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/robotiq_85_coupler.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="robotiq_coupler_joint" type="fixed">
+    <parent link="tool0" />
+    <child link="robotiq_coupler" />
+    <origin xyz="0 0 0.004" rpy="0 0 -1.57079632679" />
+  </joint>
+
+  <link name="robotiq_85_base_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_base_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_base_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="robotiq_85_base_joint" type="fixed">
+    <parent link="robotiq_coupler" />
+    <child link="robotiq_85_base_link" />
+    <origin xyz="0 0 0.004" rpy="0 -1.57079632679 3.14159265359" />
+  </joint>
+
+  <link name="robotiq_arg2f_base_link" />
+
+  <joint name="robotiq_arg2f_base_joint" type="fixed">
+    <parent link="robotiq_85_base_link" />
+    <child link="robotiq_arg2f_base_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+
+  <link name="robotiq_85_left_knuckle_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_knuckle_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_knuckle_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="robotiq_85_right_knuckle_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_knuckle_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_knuckle_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="robotiq_85_left_knuckle_joint" type="revolute">
+    <parent link="robotiq_85_base_link" />
+    <child link="robotiq_85_left_knuckle_link" />
+    <axis xyz="0 0 1" />
+    <origin xyz="0.05490451627 0.03060114443 0.0" rpy="3.14159265359 0.0 0.0" />
+    <limit lower="0.0" upper="0.802851" effort="1000.0" velocity="0.5" />
+  </joint>
+
+  <joint name="robotiq_85_right_knuckle_joint" type="continuous">
+    <parent link="robotiq_85_base_link" />
+    <child link="robotiq_85_right_knuckle_link" />
+    <axis xyz="0 0 1" />
+    <origin xyz="0.05490451627 -0.03060114443 0.0" rpy="0.0 0.0 0.0" />
+    <limit effort="1000.0" velocity="100.0" />
+    <mimic joint="robotiq_85_left_knuckle_joint" multiplier="1.0" offset="0.0" />
+  </joint>
+
+  <link name="robotiq_85_left_finger_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_finger_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_finger_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="robotiq_85_right_finger_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_finger_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_finger_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="robotiq_85_left_finger_joint" type="fixed">
+    <parent link="robotiq_85_left_knuckle_link" />
+    <child link="robotiq_85_left_finger_link" />
+    <origin xyz="-0.00408552455 -0.03148604435 0.0" rpy="0 0 0" />
+  </joint>
+
+  <joint name="robotiq_85_right_finger_joint" type="fixed">
+    <parent link="robotiq_85_right_knuckle_link" />
+    <child link="robotiq_85_right_finger_link" />
+    <origin xyz="-0.00408552455 -0.03148604435 0.0" rpy="0 0 0" />
+  </joint>
+
+  <link name="robotiq_85_left_inner_knuckle_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_inner_knuckle_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_inner_knuckle_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="robotiq_85_right_inner_knuckle_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_inner_knuckle_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_inner_knuckle_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="robotiq_85_left_inner_knuckle_joint" type="continuous">
+    <parent link="robotiq_85_base_link" />
+    <child link="robotiq_85_left_inner_knuckle_link" />
+    <axis xyz="0 0 1" />
+    <origin xyz="0.06142 0.0127 0" rpy="3.14159265359 0.0 0.0" />
+    <limit effort="0.1" velocity="100.0" />
+    <mimic joint="robotiq_85_left_knuckle_joint" multiplier="1.0" offset="0.0" />
+  </joint>
+
+  <joint name="robotiq_85_right_inner_knuckle_joint" type="continuous">
+    <parent link="robotiq_85_base_link" />
+    <child link="robotiq_85_right_inner_knuckle_link" />
+    <axis xyz="0 0 1" />
+    <origin xyz="0.06142 -0.0127 0" rpy="0 0 0" />
+    <limit effort="0.1" velocity="100.0" />
+    <mimic joint="robotiq_85_left_knuckle_joint" multiplier="1.0" offset="0.0" />
+  </joint>
+
+  <link name="robotiq_85_left_finger_tip_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_finger_tip_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_finger_tip_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="robotiq_85_right_finger_tip_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/visual/robotiq_85_finger_tip_link.dae" />
+      </geometry>
+      <material name="RobotiqBlack" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="meshes/robotiq_85/collision/robotiq_85_finger_tip_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="robotiq_85_left_finger_tip_joint" type="continuous">
+    <parent link="robotiq_85_left_inner_knuckle_link" />
+    <child link="robotiq_85_left_finger_tip_link" />
+    <axis xyz="0 0 1" />
+    <origin xyz="0.04303959807 -0.03759940821 0.0" rpy="0.0 0.0 0.0" />
+    <limit effort="0.1" velocity="100.0" />
+    <mimic joint="robotiq_85_left_knuckle_joint" multiplier="-1.0" offset="0.0" />
+  </joint>
+
+  <joint name="robotiq_85_right_finger_tip_joint" type="continuous">
+    <parent link="robotiq_85_right_inner_knuckle_link" />
+    <child link="robotiq_85_right_finger_tip_link" />
+    <axis xyz="0 0 1" />
+    <origin xyz="0.04303959807 -0.03759940821 0.0" rpy="0.0 0.0 0.0" />
+    <limit effort="0.1" velocity="100.0" />
+    <mimic joint="robotiq_85_left_knuckle_joint" multiplier="-1.0" offset="0.0" />
+  </joint>
+
+</robot>
