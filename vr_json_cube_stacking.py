@@ -1,12 +1,16 @@
 import argparse
-from collections import Counter
 from dataclasses import dataclass
-import json
-import math
 from pathlib import Path
+import time
 
-import genesis as gs
 import numpy as np
+
+from cube_stack_layout import (
+    CubePlacement, TableLayout, load_table_layout, parse_table_layout,
+    rotation_matrix_to_quaternion,
+)
+
+gs = None  # Genesis is loaded only when a simulation is actually constructed.
 
 # Paths and simulation settings.
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -15,21 +19,6 @@ DEFAULT_MAP_PATH = SCRIPT_DIR / "example_table_data.json"
 DEFAULT_VIDEO_PATH = SCRIPT_DIR / "outputs" / "vr_json_cube_stacking.mp4"
 SIM_DT = 0.01
 TARGET_CUBE_SIZE = 0.08
-# Leave the near edge of any imported table clear of the robot rack. The table
-# center is then derived from the imported depth, so its original scale can be
-# preserved instead of forcing it into the old 5 cm-cube workspace.
-WORKSPACE_TABLE_NEAR_X = 0.06
-
-# Change of basis from the VR table frame to Genesis:
-# VR +X (right) -> Genesis +Y, VR +Y (up) -> Genesis +Z,
-# VR +Z (near/down-screen) -> Genesis -X.
-VR_TO_GENESIS_AXES = np.array(
-    [
-        [0.0, 0.0, -1.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ]
-)
 
 CUBE_SIZE = (TARGET_CUBE_SIZE,) * 3
 LEFT_SPAWN_POSITION = (0.30, -0.42, CUBE_SIZE[2] / 2)
@@ -81,28 +70,6 @@ RIGHT_ARM_HOME_QPOS = np.array([0.2647, -1.0065, 1.4600, -0.4546, 0.2655, -3.140
 
 
 @dataclass(frozen=True)
-class CubePlacement:
-    cube_id: str
-    color_name: str
-    source_position: tuple[float, float, float]
-    position: tuple[float, float, float]
-    quaternion: tuple[float, float, float, float]
-
-
-@dataclass(frozen=True)
-class TableLayout:
-    source_path: Path
-    source_cube_size: float
-    scale: float
-    source_width: float
-    source_depth: float
-    workspace_width: float
-    workspace_depth: float
-    workspace_center: tuple[float, float, float]
-    placements: tuple[CubePlacement, ...]
-
-
-@dataclass(frozen=True)
 class DemoOptions:
     layout: TableLayout
     show_viewer: bool = True
@@ -110,174 +77,19 @@ class DemoOptions:
     video_fps: int = 30
     speed: float = 1.25
     physical: bool = False
+    live: bool = False
+    pool_per_color: int = 30
 
     def validate(self):
         if self.speed <= 0:
             raise ValueError("speed must be greater than zero")
         if self.video_fps <= 0:
             raise ValueError("video_fps must be greater than zero")
-        if not self.layout.placements:
+        if self.pool_per_color <= 0:
+            raise ValueError("pool_per_color must be greater than zero")
+        if not self.live and not self.layout.placements:
             raise ValueError("The VR table map does not contain any cubes.")
 
-
-def rotation_matrix_to_quaternion(rotation):
-    """Convert a 3x3 rotation matrix to a normalized (w, x, y, z) quaternion."""
-    matrix = np.asarray(rotation, dtype=float)
-    trace = np.trace(matrix)
-    if trace > 0.0:
-        scale = math.sqrt(trace + 1.0) * 2.0
-        quaternion = np.array(
-            [
-                0.25 * scale,
-                (matrix[2, 1] - matrix[1, 2]) / scale,
-                (matrix[0, 2] - matrix[2, 0]) / scale,
-                (matrix[1, 0] - matrix[0, 1]) / scale,
-            ]
-        )
-    else:
-        axis = int(np.argmax(np.diag(matrix)))
-        if axis == 0:
-            scale = math.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
-            quaternion = np.array(
-                [
-                    (matrix[2, 1] - matrix[1, 2]) / scale,
-                    0.25 * scale,
-                    (matrix[0, 1] + matrix[1, 0]) / scale,
-                    (matrix[0, 2] + matrix[2, 0]) / scale,
-                ]
-            )
-        elif axis == 1:
-            scale = math.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
-            quaternion = np.array(
-                [
-                    (matrix[0, 2] - matrix[2, 0]) / scale,
-                    (matrix[0, 1] + matrix[1, 0]) / scale,
-                    0.25 * scale,
-                    (matrix[1, 2] + matrix[2, 1]) / scale,
-                ]
-            )
-        else:
-            scale = math.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
-            quaternion = np.array(
-                [
-                    (matrix[1, 0] - matrix[0, 1]) / scale,
-                    (matrix[0, 2] + matrix[2, 0]) / scale,
-                    (matrix[1, 2] + matrix[2, 1]) / scale,
-                    0.25 * scale,
-                ]
-            )
-    return tuple(quaternion / np.linalg.norm(quaternion))
-
-
-def load_table_layout(path, target_cube_size=TARGET_CUBE_SIZE):
-    """Load and transform an openup.cube_stack.map JSON file for Genesis."""
-    path = Path(path).expanduser().resolve()
-    with path.open(encoding="utf-8") as stream:
-        data = json.load(stream)
-
-    if data.get("format") != "openup.cube_stack.map":
-        raise ValueError("Unsupported map format; expected openup.cube_stack.map.")
-    if data.get("matrix_layout") != "row_major":
-        raise ValueError("Only row-major object_to_table matrices are supported.")
-    if data.get("units") != "meters":
-        raise ValueError("The table map must use meters.")
-
-    expected_axes = {
-        "origin": "table_surface_center",
-        "x": "right",
-        "y": "up",
-        "z": "down_screen",
-    }
-    if data.get("axes") != expected_axes:
-        raise ValueError(f"Unexpected table axes: {data.get('axes')!r}.")
-
-    source_cube_size = float(data["cube_size"])
-    if not math.isfinite(source_cube_size) or source_cube_size <= 0.0:
-        raise ValueError("cube_size must be a positive finite value.")
-    scale = target_cube_size / source_cube_size
-
-    table = data["table"]
-    source_width = float(table["width"])
-    source_depth = float(table["depth"])
-    if min(source_width, source_depth) <= 0.0:
-        raise ValueError("Table width and depth must be positive.")
-
-    workspace_width = source_width * scale
-    workspace_depth = source_depth * scale
-    workspace_center = np.array(
-        [WORKSPACE_TABLE_NEAR_X + workspace_depth / 2, 0.0, 0.0]
-    )
-
-    serials = Counter()
-    placements = []
-    for cube_index, cube in enumerate(data["cubes"]):
-        color_name = str(cube["color"]).lower()
-        if color_name not in COLOR_RGB:
-            raise ValueError(f"Cube {cube_index} has unsupported color {color_name!r}.")
-
-        source_position = np.asarray(cube["position"], dtype=float)
-        if source_position.shape != (3,) or not np.all(np.isfinite(source_position)):
-            raise ValueError(f"Cube {cube_index} has an invalid position.")
-        half_cube = source_cube_size / 2
-        if abs(source_position[0]) + half_cube > source_width / 2 + 1e-5:
-            raise ValueError(f"Cube {cube_index} extends beyond the table width.")
-        if abs(source_position[2]) + half_cube > source_depth / 2 + 1e-5:
-            raise ValueError(f"Cube {cube_index} extends beyond the table depth.")
-        if source_position[1] < half_cube - 1e-5:
-            raise ValueError(f"Cube {cube_index} extends below the table surface.")
-
-        transform = np.asarray(cube["object_to_table"], dtype=float)
-        if transform.size != 16 or not np.all(np.isfinite(transform)):
-            raise ValueError(f"Cube {cube_index} has an invalid object_to_table matrix.")
-        transform = transform.reshape(4, 4)
-        if not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-6):
-            raise ValueError(f"Cube {cube_index} has an invalid homogeneous matrix row.")
-        if not np.allclose(transform[:3, 3], source_position, atol=1e-5):
-            raise ValueError(f"Cube {cube_index} matrix and position disagree.")
-
-        scaled_rotation = transform[:3, :3]
-        axis_scales = np.linalg.norm(scaled_rotation, axis=0)
-        if not np.allclose(axis_scales, source_cube_size, rtol=1e-4, atol=1e-6):
-            raise ValueError(f"Cube {cube_index} matrix scale does not match cube_size.")
-        source_rotation = scaled_rotation / source_cube_size
-        if not np.allclose(source_rotation.T @ source_rotation, np.eye(3), atol=1e-5):
-            raise ValueError(f"Cube {cube_index} contains a non-rigid rotation.")
-        if not math.isclose(np.linalg.det(source_rotation), 1.0, abs_tol=1e-5):
-            raise ValueError(f"Cube {cube_index} rotation contains a reflection.")
-
-        workspace_position = workspace_center + VR_TO_GENESIS_AXES @ (
-            scale * source_position
-        )
-        workspace_rotation = (
-            VR_TO_GENESIS_AXES @ source_rotation @ VR_TO_GENESIS_AXES.T
-        )
-        serials[color_name] += 1
-        placements.append(
-            CubePlacement(
-                cube_id=f"{color_name}_{serials[color_name]}",
-                color_name=color_name,
-                source_position=tuple(float(value) for value in source_position),
-                position=tuple(float(value) for value in workspace_position),
-                quaternion=tuple(
-                    float(value)
-                    for value in rotation_matrix_to_quaternion(workspace_rotation)
-                ),
-            )
-        )
-
-    # Preserve the producer's order. In the example, this encodes the blue
-    # structure's support dependencies before unrelated ground-level cubes.
-    return TableLayout(
-        source_path=path,
-        source_cube_size=source_cube_size,
-        scale=scale,
-        source_width=source_width,
-        source_depth=source_depth,
-        workspace_width=workspace_width,
-        workspace_depth=workspace_depth,
-        workspace_center=tuple(float(value) for value in workspace_center),
-        placements=tuple(placements),
-    )
 
 
 def to_numpy(value):
@@ -297,6 +109,13 @@ class ColorCubeDemo:
         self.carried_block = None
         self.carried_tool = None
         self.carried_quaternion = None
+        self.live_client = None
+        self.live_queue = None
+
+        global gs
+        if gs is None:
+            import genesis as gs_module
+            gs = gs_module
 
         # A fixed seed makes IK behavior deterministic.
         gs.init(backend=gs.cpu, seed=0)
@@ -337,7 +156,14 @@ class ColorCubeDemo:
         # workspace until its turn at the color-specific feeder.
         material = gs.materials.Rigid(rho=200.0, friction=2.0)
         blocks = {}
-        for index, placement in enumerate(self.layout.placements):
+        placements = self.layout.placements
+        if self.options.live:
+            placements = tuple(
+                CubePlacement(f"{color}_{serial}", color, (0, 0, 0), (0, 0, 0), (1, 0, 0, 0))
+                for color in COLOR_RGB
+                for serial in range(1, self.options.pool_per_color + 1)
+            )
+        for index, placement in enumerate(placements):
             parked_position = (
                 PARKED_BLOCK_ORIGIN[0] + index * 0.08,
                 PARKED_BLOCK_ORIGIN[1],
@@ -483,6 +309,11 @@ class ColorCubeDemo:
         self.scene.step()
 
     def _step(self):
+        if self.live_client is not None:
+            self.live_client.pump()
+            queue = self.live_queue if getattr(self, "live_queue", None) is not None else self.live_client.queue
+            if queue.halted:
+                raise RuntimeError(f"HALTED: {queue.halt_reason}")
         self.scene.step()
         self.step_count += 1
         if self.carried_block is not None:
@@ -544,12 +375,14 @@ class ColorCubeDemo:
         )
 
         error = np.abs(to_numpy(error))
-        if np.max(error[:3]) > 0.003 or np.max(error[3:]) > 0.015:
+        qpos = to_numpy(qpos)
+        if (not np.all(np.isfinite(error)) or not np.all(np.isfinite(qpos))
+                or np.max(error[:3]) > 0.003 or np.max(error[3:]) > 0.015):
             raise RuntimeError(
                 f"IK failed for target {position}; pose error was {error}"
             )
 
-        self._move_joints(robot, to_numpy(qpos)[:6], ARM_DOFS, steps, settle)
+        self._move_joints(robot, qpos[:6], ARM_DOFS, steps, settle)
 
     def _pick_and_place(self, robot, tool, block, pick_position, placement):
         pick_position = np.asarray(pick_position)
@@ -621,13 +454,14 @@ class ColorCubeDemo:
         self.recording_camera.start_recording()
         self.recording_camera.render()
 
-    def _stop_recording(self):
+    def _stop_recording(self, settle=True):
         if self.recording_camera is None:
             return
 
         # Leave the completed color layout on screen briefly before ending the video.
-        for _ in range(round(0.75 / SIM_DT)):
-            self._step()
+        if settle:
+            for _ in range(round(0.75 / SIM_DT)):
+                self._step()
         output_path = self.options.record_path.resolve()
         self.recording_camera.stop_recording(
             save_to_filename=str(output_path),
@@ -655,6 +489,11 @@ class ColorCubeDemo:
     def _place_colored_cubes(self):
         """Spawn and place every transformed JSON cube from bottom to top."""
         for placement in self.layout.placements:
+            self.place_live_cube(placement)
+
+    def place_live_cube(self, placement):
+        """Execute one arbitrary imported pose; the caller owns queue ordering."""
+        try:
             robot, tool, home = self._arm_for_placement(placement)
             block = self.blocks[placement.cube_id]
             spawn_position = self._spawn_block(block, placement, robot)
@@ -668,6 +507,38 @@ class ColorCubeDemo:
             )
             self._park(robot, home)
             self.placed_placements.append(placement)
+        finally:
+            # Never allow a failed partial move to keep moving a carried cube.
+            self.carried_block = None
+            self.carried_tool = None
+            self.carried_quaternion = None
+
+    def run_live(self, queue, client, max_cubes=0):
+        """Only this outer loop starts commands; _step only receives/enqueues."""
+        self.live_client = client
+        self.live_queue = queue
+        self._start_recording()
+        print(f"ready: session={queue.session_id} pool_per_color={self.options.pool_per_color}", flush=True)
+        try:
+            while not max_cubes or queue.completed_count < max_cubes:
+                client.pump()
+                if queue.halted:
+                    raise RuntimeError(f"HALTED: {queue.halt_reason}")
+                placement = queue.start_next()
+                if placement is None:
+                    self._step()
+                    time.sleep(SIM_DT)
+                    continue
+                self.place_live_cube(placement)
+                queue.complete_active()
+        except BaseException as error:
+            queue.fail_active(str(error) or type(error).__name__)
+            self.carried_block = self.carried_tool = self.carried_quaternion = None
+            raise
+        finally:
+            # Saving a failed run must not advance the scene or issue commands.
+            self._stop_recording(settle=False)
+        print(f"live complete: accepted={queue.accepted_count} completed={queue.completed_count}", flush=True)
 
     def _print_final_positions(self):
         print("VR cubes placed. Target -> final position (meters):")
@@ -715,7 +586,47 @@ def main(
     return demo
 
 
-def parse_args():
+def live_main(host="127.0.0.1", port=9036, pool_per_color=30, receive_only=False,
+              max_cubes=0, timeout=0, show_viewer=True, record_path=None,
+              video_fps=30, speed=1.25, physical=False):
+    from cube_stack_stream import LiveMapQueue, LiveStreamClient
+
+    def report(message):
+        print(message, flush=True)
+
+    queue = LiveMapQueue(pool_per_color=pool_per_color, report=report)
+    client = LiveStreamClient(queue, host=host, port=port, report=report)
+    deadline = time.monotonic() + timeout if timeout else None
+    try:
+        print(f"waiting: CubeStack/Map at {host}:{port}", flush=True)
+        while receive_only or queue.layout is None:
+            client.pump()
+            if queue.halted:
+                raise RuntimeError(f"HALTED: {queue.halt_reason}")
+            if receive_only and queue.layout is not None and max_cubes and queue.accepted_count >= max_cubes:
+                print(f"receive-only complete: session={queue.session_id} accepted={queue.accepted_count} completed=0", flush=True)
+                return queue
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Timed out receiving the requested live map/cube count")
+            time.sleep(0.01)
+        options = DemoOptions(
+            layout=queue.layout, live=True, pool_per_color=pool_per_color,
+            show_viewer=show_viewer,
+            record_path=Path(record_path).expanduser() if record_path is not None else None,
+            video_fps=video_fps, speed=speed, physical=physical,
+        )
+        try:
+            demo = ColorCubeDemo(options)
+        except Exception as error:
+            queue.fail_active(error)
+            raise
+        demo.run_live(queue, client, max_cubes=max_cubes)
+        return demo
+    finally:
+        client.close()
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Rebuild a VR table-map JSON cube layout with dual UR5e arms."
     )
@@ -759,16 +670,38 @@ def parse_args():
             "robot kinematically and preserve the JSON poses"
         ),
     )
-    return parser.parse_args()
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--live", action="store_true", help="receive append-only CubeStack/Map snapshots and place cubes continuously")
+    mode.add_argument("--receive-only", action="store_true", help="validate/queue real live maps without importing Genesis or moving robots")
+    parser.add_argument("--host", default="127.0.0.1", help="OpenUp table host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=9036, help="OpenUp simulation stream port (default: 9036)")
+    parser.add_argument("--pool-per-color", type=int, default=30, help="prebuilt 8 cm cubes per color (default: 30)")
+    parser.add_argument("--max-cubes", type=int, default=0, help="stop after N completed live placements or accepted receive-only cubes (0: continuous)")
+    parser.add_argument("--timeout", type=float, default=0, help="seconds to wait for startup metadata or receive-only target count (0: unlimited; never interrupts motion)")
+    args = parser.parse_args(argv)
+    if not 0 < args.port < 65536 or args.pool_per_color <= 0 or args.max_cubes < 0 or args.timeout < 0:
+        parser.error("port must be 1..65535, pool-per-color positive, max-cubes and timeout nonnegative")
+    return args
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(
-        map_path=args.map_path,
+    options = dict(
         show_viewer=not args.headless,
         record_path=args.record,
         video_fps=args.fps,
         speed=args.speed,
         physical=args.physical,
     )
+    try:
+        if args.live or args.receive_only:
+            live_main(host=args.host, port=args.port, pool_per_color=args.pool_per_color,
+                      receive_only=args.receive_only, max_cubes=args.max_cubes,
+                      timeout=args.timeout, **options)
+        else:
+            main(map_path=args.map_path, **options)
+    except KeyboardInterrupt:
+        print("stopped: live session interrupted; restart explicitly to resume with a fresh simulation", flush=True)
+    except Exception as error:
+        print(f"failed: {error}", flush=True)
+        raise SystemExit(1)
