@@ -238,8 +238,12 @@ console messages distinguish accepted work from finished robot motion.
 Network ingestion continues during trajectories, and only the outer loop
 starts a placement.
 
-The publisher sends complete `CubeStack/Map` snapshots after edits and every
-500 ms while subscribed. New cubes may be added while the robot is working.
+The updated OpenUp publisher sends its complete cumulative placement history
+through `CubeStack/Map` after new placements and every 500 ms while subscribed.
+Each cube's table pose and color are recorded when it is created and remain
+unchanged in that history. New cubes may be added while the robot is working,
+including after earlier cubes have been moved, rotated, or deleted in OpenUp.
+Those edits do not block later placements or change queued or active robot work.
 Moving the desktop camera and choosing the color of future cubes are supported.
 
 Use the existing `--headless`, `--speed`, `--record`, `--fps`, and `--physical`
@@ -262,31 +266,51 @@ reservation, and queue acceptance without importing Genesis:
 Receive-only needs NumPy and Python but does not need Genesis. It exits with
 status 0 once N cubes have been accepted, and reports `completed=0` because
 no robot ran. Its timeout covers the entire diagnostic. A timeout, malformed
-message, pool exhaustion, or rejected map exits with status 1. Omitting both
-limits keeps receiving until Ctrl+C.
+stream frame, pool exhaustion, or fatal map rejection exits with status 1.
+Non-placement edits leave the updated publisher's placement records unchanged.
+Omitting both limits keeps receiving until Ctrl+C.
 
 The wire format is two uint32 little-endian length-prefixed blocks: a JSON
 header followed by the UTF-8 V2 `openup.cube_stack.map` payload. The header
 uses `stream: CubeStack/Map`, `content_type: application/json`, a matching
 `payload_bytes`, and a **string** containing JSON metadata with
 `protocol_version: 1` and a per-table-process `session_id`. Each block is
-limited to 64 MiB. The original table-local positions and scaled row-major
-`object_to_table` matrices use the same parser as offline file replay.
+limited to 64 MiB. This schema and framing are unchanged; the live `cubes` array
+now contains immutable placement records rather than OpenUp's current edited
+map. The original table-local positions and scaled row-major `object_to_table`
+matrices use the same parser as offline file replay.
 
-Maps must keep the table metadata and every previously accepted cube record
-unchanged. Repeated snapshots and reconnecting to the same table process
-never duplicate queued, active, or completed cubes. Transport failures retry
-without clearing accepted work. Moving/deleting cubes, changing table
-metadata, starting another table process, exceeding a color pool, or an IK
-failure produces a visible `HALTED` state and stops further robot commands.
-A partial motion is never retried automatically. Begin a fresh simulation
-explicitly after resolving the cause: stop the receiver with **Ctrl+C**, restart
-the chosen OpenUp publisher with an empty construction, then start a new
-receiver and wait for `ready` before adding cubes. Live sessions are
-**additions only**: placing rows and stacking new cubes is supported; moving,
-rotating, or deleting accepted cubes is not. Kinematic replay preserves
-requested poses; `--physical` enables free rigid bodies to assess stability
-separately.
+Live sessions replay **new placements only**. The simulation retains each
+cube's original pose and color, including cubes later deleted in OpenUp.
+The desktop, physical table, headset, and F5 exports continue to show the current
+edited map. A later cube keeps its actual pose and height when created; the
+robot does not recompute stack heights or restack earlier cubes after edits.
+
+Each placement permanently reserves one pool object of its color for that
+session, even if the cube is later deleted in OpenUp. With `--pool-per-color 30`,
+the cumulative history may contain at most 30 placements of each color. Increase
+that limit before startup when needed.
+
+Repeated snapshots and reconnecting to the same table process never duplicate
+queued, active, or completed cubes. New subscribers receive the complete
+placement history, and transport failures retry without clearing accepted work.
+Changed table metadata, another table process, malformed stream frames,
+exceeding a color pool, or an IK failure still produces a visible `HALTED`
+state and stops further robot commands. A partial motion is never retried
+automatically.
+
+For legacy publishers that still send the current full map, the receiver
+continues to ignore an entire snapshot if it changes or removes the previously
+accepted prefix. The console reports `ignored:`, and existing robot work
+continues. This compatibility fallback cannot identify new cube births within
+an edited snapshot; use the updated OpenUp publisher to continue placing cubes
+after edits.
+
+To begin a fresh simulation, stop the receiver with **Ctrl+C**, restart the
+chosen OpenUp publisher with an empty construction, then start a new receiver
+and wait for `ready` before adding cubes. Placing rows and stacking new cubes
+is supported. Kinematic replay preserves requested poses; `--physical` enables
+free rigid bodies to assess stability separately.
 
 ## Third-party robot assets
 

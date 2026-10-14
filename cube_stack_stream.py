@@ -113,6 +113,7 @@ class LiveMapQueue:
         self.completed_count = 0
         self.halted = False
         self.halt_reason = None
+        self._ignoring_edits = False
 
     @property
     def accepted_count(self):
@@ -129,12 +130,13 @@ class LiveMapQueue:
             self.report(f"rejected: HALTED: {reason}; restart the live simulation to begin a new session")
 
     def accept(self, header, data):
-        """Return additions, 0 for a repeat, or -1 for a halted rejection."""
+        """Return additions, 0 for a repeat/ignored edit, or -1 for a fatal rejection."""
         if self.halted:
             return -1
         try:
             metadata = validate_header(header)
-            layout = parse_table_layout(data)
+            if not isinstance(data, dict):
+                raise ProtocolError("The table map must be a JSON object.")
             if self.session_id is not None and metadata["session_id"] != self.session_id:
                 raise ProtocolError("table session changed")
             if self._accepted is not None:
@@ -142,9 +144,16 @@ class LiveMapQueue:
                 current_metadata = {key: value for key, value in data.items() if key != "cubes"}
                 if previous_metadata != current_metadata:
                     raise ProtocolError("table metadata changed")
+                if not isinstance(data.get("cubes"), list):
+                    raise ProtocolError("cubes must be a JSON list.")
                 previous = self._accepted["cubes"]
                 if len(data["cubes"]) < len(previous) or data["cubes"][:len(previous)] != previous:
-                    raise ProtocolError("accepted cube prefix changed or shrank")
+                    if not self._ignoring_edits:
+                        self.report("ignored: accepted cubes changed or were deleted; keeping the last accepted construction")
+                    self._ignoring_edits = True
+                    return 0
+            layout = parse_table_layout(data)
+            self._ignoring_edits = False
             additions = layout.placements[self.accepted_count:]
             if self._accepted is not None and not additions:
                 return 0
