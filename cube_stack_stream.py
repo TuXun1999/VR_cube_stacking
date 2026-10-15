@@ -1,9 +1,10 @@
-"""Bounded OpenUp stream decoding and append-only placement acceptance.
+"""Bounded OpenUp stream decoding and desired-state robot reconciliation.
 
 The client is pumped by its owner thread. It never executes robot commands.
 """
-from collections import Counter, deque
+from collections import Counter
 import copy
+from dataclasses import dataclass
 import errno
 import json
 import math
@@ -12,7 +13,7 @@ import socket
 import struct
 import time
 
-from cube_stack_layout import parse_table_layout
+from cube_stack_layout import CubePlacement, parse_table_layout
 
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 
@@ -54,8 +55,8 @@ def validate_header(header):
     if not isinstance(header.get("metadata"), str):
         raise ProtocolError("metadata must be a JSON string")
     metadata = _json_object(header["metadata"], "metadata")
-    if type(metadata.get("protocol_version")) is not int or metadata["protocol_version"] != 1:
-        raise ProtocolError("Unsupported protocol_version; expected 1")
+    if type(metadata.get("protocol_version")) is not int or metadata["protocol_version"] not in (1, 2):
+        raise ProtocolError("Unsupported protocol_version; expected 1 or 2")
     if not isinstance(metadata.get("session_id"), str) or not metadata["session_id"]:
         raise ProtocolError("metadata session_id must be a nonempty string")
     return metadata
@@ -96,8 +97,28 @@ class FrameDecoder:
         return frames
 
 
+@dataclass(frozen=True)
+class LiveCommand:
+    """One acknowledged robot operation; reset has no cube placement."""
+
+    kind: str
+    placement: CubePlacement | None = None
+    reset_generation: int = 0
+
+    @property
+    def cube_id(self):
+        return self.placement.cube_id if self.placement is not None else "reset"
+
+
 class LiveMapQueue:
-    """Reserve complete snapshots atomically, including queued/active cubes."""
+    """Accept whole maps atomically and reconcile only the newest desired state.
+
+    ``realized`` records acknowledged robot results. A newer snapshot never
+    mutates an active command; completing it records its actual target, after
+    which the next command catches up with the newest desired map. Reset is the
+    explicit exception: the owner may cancel an interrupted command and return
+    the entire pool to staging before acknowledging the reset.
+    """
 
     def __init__(self, pool_per_color=30, report=print):
         if type(pool_per_color) is not int or pool_per_color <= 0:
@@ -105,12 +126,17 @@ class LiveMapQueue:
         self.pool_per_color = pool_per_color
         self.report = report
         self.session_id = None
+        self.protocol_version = None
         self.layout = None
         self._accepted = None
-        self._pending = deque()
+        self.revision = None
+        self.reset_generation = 0
+        self._acknowledged_generation = 0
+        self.realized = {}
         self.reserved = Counter()
         self.active = None
         self.completed_count = 0
+        self.completed_command_count = 0
         self.halted = False
         self.halt_reason = None
 
@@ -120,7 +146,22 @@ class LiveMapQueue:
 
     @property
     def pending_count(self):
-        return len(self._pending)
+        projected = dict(self.realized)
+        active_reset_generation = None
+        if self.active is not None:
+            self._apply_result(projected, self.active)
+            if self.active.kind == "reset":
+                active_reset_generation = self.active.reset_generation
+        if self.reset_pending:
+            # A reset in flight already accounts for its own generation. A
+            # newer reset still needs a separate acknowledgement.
+            extra_reset = int(active_reset_generation != self.reset_generation)
+            return extra_reset + self.accepted_count
+        return len(self._commands_for(projected))
+
+    @property
+    def reset_pending(self):
+        return self.reset_generation > self._acknowledged_generation
 
     def halt(self, reason):
         if not self.halted:
@@ -129,56 +170,145 @@ class LiveMapQueue:
             self.report(f"rejected: HALTED: {reason}; restart the live simulation to begin a new session")
 
     def accept(self, header, data):
-        """Return additions, 0 for a repeat, or -1 for a halted rejection."""
+        """Return changed desired IDs, 0 for a repeat/stale map, or -1 on halt."""
         if self.halted:
             return -1
         try:
             metadata = validate_header(header)
-            layout = parse_table_layout(data)
+            protocol = metadata["protocol_version"]
+            if not isinstance(data, dict):
+                raise ProtocolError("payload must be a JSON object")
             if self.session_id is not None and metadata["session_id"] != self.session_id:
                 raise ProtocolError("table session changed")
+            if self.protocol_version is not None and protocol != self.protocol_version:
+                raise ProtocolError("stream protocol changed")
             if self._accepted is not None:
-                previous_metadata = {key: value for key, value in self._accepted.items() if key != "cubes"}
-                current_metadata = {key: value for key, value in data.items() if key != "cubes"}
+                ignored = {"cubes", "revision", "reset_generation"} if protocol == 2 else {"cubes"}
+                previous_metadata = {key: value for key, value in self._accepted.items() if key not in ignored}
+                current_metadata = {key: value for key, value in data.items() if key not in ignored}
                 if previous_metadata != current_metadata:
                     raise ProtocolError("table metadata changed")
+            if protocol == 2:
+                for field in ("revision", "reset_generation"):
+                    if type(data.get(field)) is not int or data[field] < 0:
+                        raise ProtocolError(f"{field} must be a nonnegative integer")
+                revision = data["revision"]
+                generation = data["reset_generation"]
+                if self._accepted is not None:
+                    if generation < self.reset_generation:
+                        return 0
+                    if generation == self.reset_generation:
+                        if revision < self.revision:
+                            return 0
+                        if revision == self.revision:
+                            if data != self._accepted:
+                                raise ProtocolError("payload changed at the same revision")
+                            return 0
+            else:
+                revision = 0 if self.revision is None else self.revision + 1
+                generation = 0
+            layout = parse_table_layout(data, require_ids=protocol == 2)
+            if protocol == 1 and self._accepted is not None:
                 previous = self._accepted["cubes"]
                 if len(data["cubes"]) < len(previous) or data["cubes"][:len(previous)] != previous:
                     raise ProtocolError("accepted cube prefix changed or shrank")
-            additions = layout.placements[self.accepted_count:]
-            if self._accepted is not None and not additions:
-                return 0
-            proposed = self.reserved + Counter(placement.color_name for placement in additions)
+                if data == self._accepted:
+                    return 0
+            proposed = Counter(placement.color_name for placement in layout.placements)
             for color, count in proposed.items():
                 if count > self.pool_per_color:
                     raise ProtocolError(f"{color} pool exhausted: needs {count}, capacity {self.pool_per_color}")
+            desired = {placement.cube_id: placement for placement in layout.placements}
+            previous_desired = self._desired()
+            known = dict(previous_desired)
+            if not self.reset_pending:
+                known.update(self.realized)
+            if (self.active is not None and self.active.placement is not None
+                    and self.active.reset_generation == generation):
+                known[self.active.cube_id] = self.active.placement
+            # An explicit reset starts fresh identities, but same-generation
+            # edits cannot turn an allocated red body into a blue body.
+            if generation == self.reset_generation:
+                for cube_id in desired.keys() & known.keys():
+                    if desired[cube_id].color_name != known[cube_id].color_name:
+                        raise ProtocolError(f"Cube {cube_id!r} changed color")
+            changed = sum(previous_desired.get(cube_id) != desired.get(cube_id)
+                          for cube_id in previous_desired.keys() | desired.keys())
             # No observable queue state changes until the whole snapshot passed.
             self.session_id = metadata["session_id"]
+            self.protocol_version = protocol
             self._accepted = copy.deepcopy(data)
             self.layout = layout
+            self.revision = revision
+            self.reset_generation = generation
             self.reserved = proposed
-            self._pending.extend(additions)
-            for placement in additions:
-                self.report(f"queued: {placement.cube_id} color={placement.color_name} position={placement.position} quaternion={placement.quaternion}")
-            if additions or self.accepted_count == 0:
-                self.report(f"accepted: session={self.session_id} cubes={self.accepted_count} queued={self.pending_count} completed={self.completed_count}")
-            return len(additions)
+            self.report(f"accepted: session={self.session_id} revision={revision} reset_generation={generation} cubes={self.accepted_count} queued={self.pending_count} completed={self.completed_count}")
+            return changed
         except (ValueError, KeyError, TypeError, OverflowError, RecursionError) as error:
             self.halt(error)
             return -1
 
     def start_next(self):
-        if self.halted or self.active is not None or not self._pending:
+        if self.halted or self.active is not None:
             return None
-        self.active = self._pending.popleft()
-        self.report(f"started: {self.active.cube_id}")
+        if self.reset_pending:
+            self.active = LiveCommand("reset", reset_generation=self.reset_generation)
+        else:
+            commands = self._commands_for(self.realized)
+            if not commands:
+                return None
+            self.active = commands[0]
+        self.report(f"started: {self.active.kind} {self.active.cube_id}")
         return self.active
+
+    def _desired(self):
+        return {placement.cube_id: placement for placement in self.layout.placements} if self.layout is not None else {}
+
+    def _commands_for(self, realized):
+        desired = self._desired()
+        removed = [placement for cube_id, placement in realized.items() if cube_id not in desired]
+        materialized = [placement for cube_id, placement in desired.items()
+                        if cube_id not in realized or placement != realized[cube_id]]
+        removed.sort(key=lambda placement: -placement.position[2])
+        # New support cubes and moves share one bottom-up order. Sorting keeps
+        # the producer's order for equal-height targets regardless of kind.
+        materialized.sort(key=lambda placement: placement.position[2])
+        return ([LiveCommand("delete", placement, self.reset_generation) for placement in removed]
+                + [LiveCommand("move" if placement.cube_id in realized else "add",
+                               placement, self.reset_generation)
+                   for placement in materialized])
+
+    @staticmethod
+    def _apply_result(realized, command):
+        if command.kind == "reset":
+            realized.clear()
+        elif command.kind == "delete":
+            realized.pop(command.cube_id, None)
+        else:
+            realized[command.cube_id] = command.placement
 
     def complete_active(self):
         if self.active is None:
-            raise RuntimeError("No active placement to complete")
-        self.report(f"completed: {self.active.cube_id}")
-        self.completed_count += 1
+            raise RuntimeError("No active command to complete")
+        command = self.active
+        self._apply_result(self.realized, command)
+        if command.kind == "reset":
+            self._acknowledged_generation = command.reset_generation
+            self.completed_count = 0
+            self.completed_command_count = 0
+        else:
+            self.completed_command_count += 1
+            if command.kind == "add":
+                self.completed_count += 1
+        self.report(f"completed: {command.kind} {command.cube_id}")
+        self.active = None
+
+    def cancel_active_for_reset(self):
+        """Forget an interrupted operation only when a whole-pool reset follows."""
+        if not self.reset_pending:
+            raise RuntimeError("Cannot cancel an active command without a pending reset")
+        if self.active is not None:
+            self.report(f"cancelled: {self.active.kind} {self.active.cube_id} for reset")
         self.active = None
 
     def fail_active(self, reason):

@@ -98,15 +98,15 @@ def load_table_layout(path, target_cube_size=TARGET_CUBE_SIZE):
     return parse_table_layout(data, target_cube_size, source_path=path)
 
 
-def parse_table_layout(data, target_cube_size=TARGET_CUBE_SIZE, source_path="<live>"):
+def parse_table_layout(data, target_cube_size=TARGET_CUBE_SIZE, source_path="<live>", *, require_ids=False):
     """Validate a decoded complete V2 map and convert its right-handed frame."""
     try:
-        return _parse_table_layout(data, target_cube_size, Path(source_path))
+        return _parse_table_layout(data, target_cube_size, Path(source_path), require_ids)
     except (KeyError, TypeError, OverflowError) as error:
         raise ValueError(f"Malformed table map: {error}") from error
 
 
-def _parse_table_layout(data, target_cube_size, path):
+def _parse_table_layout(data, target_cube_size, path, require_ids):
     if not isinstance(data, dict):
         raise ValueError("The table map must be a JSON object.")
     if data.get("version") != 2:
@@ -158,6 +158,7 @@ def _parse_table_layout(data, target_cube_size, path):
         raise ValueError("Derived workspace center must be finite.")
 
     serials = Counter()
+    cube_ids = set()
     placements = []
     for cube_index, cube in enumerate(cubes):
         if not isinstance(cube, dict):
@@ -165,15 +166,26 @@ def _parse_table_layout(data, target_cube_size, path):
         color_name = str(cube["color"]).lower()
         if color_name not in COLOR_RGB:
             raise ValueError(f"Cube {cube_index} has unsupported color {color_name!r}.")
+        serials[color_name] += 1
+        cube_id = cube.get("id", f"{color_name}_{serials[color_name]}")
+        if require_ids and "id" not in cube:
+            raise ValueError(f"Cube {cube_index} requires a stable id for live protocol 2.")
+        if not isinstance(cube_id, str) or not cube_id:
+            raise ValueError(f"Cube {cube_index} id must be a nonempty string.")
+        if cube_id in cube_ids:
+            raise ValueError(f"Duplicate cube id {cube_id!r}.")
+        cube_ids.add(cube_id)
 
         source_position = np.asarray(cube["position"], dtype=float)
         if source_position.shape != (3,) or not np.all(np.isfinite(source_position)):
             raise ValueError(f"Cube {cube_index} has an invalid position.")
         half_cube = source_cube_size / 2
-        if abs(source_position[0]) + half_cube > source_width / 2 + 1e-5:
-            raise ValueError(f"Cube {cube_index} extends beyond the table width.")
-        if abs(source_position[2]) + half_cube > source_depth / 2 + 1e-5:
-            raise ValueError(f"Cube {cube_index} extends beyond the table depth.")
+        # OpenUp accepts centers on the table boundary, including the natural
+        # half-cube overhang at its edge.
+        if abs(source_position[0]) > source_width / 2 + 1e-5:
+            raise ValueError(f"Cube {cube_index} center is beyond the table width.")
+        if abs(source_position[2]) > source_depth / 2 + 1e-5:
+            raise ValueError(f"Cube {cube_index} center is beyond the table depth.")
         if source_position[1] < half_cube - 1e-5:
             raise ValueError(f"Cube {cube_index} extends below the table surface.")
 
@@ -205,10 +217,9 @@ def _parse_table_layout(data, target_cube_size, path):
         workspace_rotation = (
             VR_TO_GENESIS_AXES @ source_rotation @ VR_TO_GENESIS_AXES.T
         )
-        serials[color_name] += 1
         placements.append(
             CubePlacement(
-                cube_id=f"{color_name}_{serials[color_name]}",
+                cube_id=cube_id,
                 color_name=color_name,
                 source_position=tuple(float(value) for value in source_position),
                 position=tuple(float(value) for value in workspace_position),

@@ -2,8 +2,8 @@
 
 An interactive dual-arm UR5e demonstration built with the Genesis physics
 engine. A user selects red, green, or blue cubes in a 5 x 8 design panel and
-places them on table anchors. In live mode, each placement is queued
-immediately and executed by the corresponding robot arm.
+places them on table anchors. In OpenUp live mode, the robot builds the current
+construction and follows cube moves, deletions, and explicit session resets.
 
 ## Features
 
@@ -25,6 +25,8 @@ immediately and executed by the corresponding robot arm.
 ├── vr_json_cube_stacking.py        # VR table-map importer and robot replay
 ├── cube_stack_layout.py           # Shared Genesis-free V2 map parser
 ├── cube_stack_stream.py           # Live stream decoder and acceptance queue
+├── cube_stack_staging.py          # Outside-table supply/return stack allocation
+├── verify_live_edits.py           # Headless Genesis edit/reset verification
 ├── example_table_data.json         # Example openup.cube_stack.map input
 ├── table_frame.png                 # VR table-frame convention
 ├── export_ur5e_robotiq_video.sh    # Headless video-export helper
@@ -229,18 +231,55 @@ python3 -u vr_json_cube_stacking.py --live --host 127.0.0.1 --port 9036 --pool-p
 ```
 
 The receiver waits for the first map, including an empty table, builds Genesis
-once, and prints `ready` after scene initialization. It prebuilds 30 parked
-8 cm cubes for each color before `scene.build()`. Each accepted addition
-reserves one pool object and enters the queue in the table's placement order.
-Imported positions and rotations remain arbitrary; the VR replay chooses the
-arm on the target side of the table. `queued`, `started`, and `completed`
-console messages distinguish accepted work from finished robot motion.
-Network ingestion continues during trajectories, and only the outer loop
-starts a placement.
+once, and prints `ready` after scene initialization. It prebuilds 30 reusable
+8 cm cube entities per color. Each new cube appears on a staging surface
+beside the table's left or right edge before the robot picks it up. These
+surfaces are level with the construction table; all cells sit beyond its lateral
+footprint, near its rack-facing end. Each side shows three continuous rectangular
+strips in red, green, and blue, with matching lengths and aligned ends. Nine
+pickup cells on each side hold supply and returns on matching strips: red cubes
+use red, green use green, and blue use blue. New cubes spawn on their own strip,
+and deletion returns and temporary staging moves keep that color assignment.
+Each color has six cells across both sides; balanced storage holds its default
+30-cube return pool in five tiers. Returned cubes remain visible and supply
+later same-color placements. The robot uncovers buried objects before
+picking them.
+
+Hold a shadow in OpenUp to select, drag and release gently to request a move,
+or swipe quickly and release to delete. The robot picks existing cubes from
+their actual simulated poses and carries an ordinary requested move directly
+to its new pose in one transfer. Deletion carries the cube to staging. Other
+cubes move only when they block the pickup or destination: changed blockers
+can go directly to their own ready targets, while blockers that need temporary
+space use staging. A swap stages the other cube, moves the requested cube
+directly, then restores the other cube. Unrelated queued moves wait their turn;
+new supports are placed before cubes that depend on them. Both arms check the
+complete transfer path before motion. When neither arm can reach both endpoints
+in one transfer, the controller chooses a clear handoff point near the table
+center and validates both arms' transfer paths before pickup.
+Genuine support cycles first clear the upper cube before moving its support.
+
+`accepted`, `started: add/move/delete/reset`, and `completed` messages identify
+desired state and finished robot work. Network ingestion continues during
+trajectories. Pending edits coalesce to the newest committed layout; an active
+transfer finishes to a known pose before following newer edits. Held-drag
+previews are not robot targets. Repeated snapshots and reconnection to the
+same publisher do not duplicate work.
 
 The publisher sends complete `CubeStack/Map` snapshots after edits and every
 500 ms while subscribed. New cubes may be added while the robot is working.
 Moving the desktop camera and choosing the color of future cubes are supported.
+
+### Reset without restarting
+
+Tap **Reset session** below the palette, then tap it again within three
+seconds to confirm. Alternatively press and release **F6 twice** within three
+seconds on the OpenUp computer. Reset clears OpenUp's cubes, selection and
+construction transform, restores the blue palette choice, cancels robot work
+at the next simulation step, resets the reusable supply, and homes both arms.
+The Genesis scene remains built and connected; headset/table calibration and
+map configuration are preserved. You can start another construction immediately.
+The existing **R** key still resets only the desktop camera.
 
 Use the existing `--headless`, `--speed`, `--record`, `--fps`, and `--physical`
 flags with `--live`. For a bounded headless run:
@@ -249,7 +288,7 @@ flags with `--live`. For a bounded headless run:
 .\.venv\Scripts\python.exe vr_json_cube_stacking.py --live --headless --max-cubes 3 --timeout 20
 ```
 
-`--max-cubes N` stops after N completed placements in live mode; `0` runs
+`--max-cubes N` stops after N completed additions since the latest reset; `0` runs
 continuously. `--timeout SEC` limits the initial wait for table metadata and
 does not interrupt a trajectory. Ctrl+C ends the session. A separate
 receive-only diagnostic exercises the same real decoding, validation, pool
@@ -269,24 +308,43 @@ The wire format is two uint32 little-endian length-prefixed blocks: a JSON
 header followed by the UTF-8 V2 `openup.cube_stack.map` payload. The header
 uses `stream: CubeStack/Map`, `content_type: application/json`, a matching
 `payload_bytes`, and a **string** containing JSON metadata with
-`protocol_version: 1` and a per-table-process `session_id`. Each block is
+`protocol_version: 2` and a per-table-process `session_id`. Each cube carries a
+stable string `id`; the map carries a monotonic `revision` and explicit
+`reset_generation`. The generation survives missed intermediate reset maps,
+including a reset immediately followed by a new placement. Each block is
 limited to 64 MiB. The original table-local positions and scaled row-major
 `object_to_table` matrices use the same parser as offline file replay.
 
-Maps must keep the table metadata and every previously accepted cube record
-unchanged. Repeated snapshots and reconnecting to the same table process
-never duplicate queued, active, or completed cubes. Transport failures retry
-without clearing accepted work. Moving/deleting cubes, changing table
-metadata, starting another table process, exceeding a color pool, or an IK
-failure produces a visible `HALTED` state and stops further robot commands.
-A partial motion is never retried automatically. Begin a fresh simulation
-explicitly after resolving the cause: stop the receiver with **Ctrl+C**, restart
-the chosen OpenUp publisher with an empty construction, then start a new
-receiver and wait for `ready` before adding cubes. Live sessions are
-**additions only**: placing rows and stacking new cubes is supported; moving,
-rotating, or deleting accepted cubes is not. Kinematic replay preserves
-requested poses; `--physical` enables free rigid bodies to assess stability
-separately.
+Transport failures retry without clearing accepted work. Table dimensions and
+cube colors remain fixed within a generation. Changing table metadata,
+starting another publisher process, exceeding simultaneous color capacity,
+malformed frames, or an unreachable robot transfer produces a visible `HALTED`
+state. A failed partial motion is not retried automatically: stop the receiver,
+reset OpenUp, restart the receiver, and wait for `ready`. Ordinary construction
+reset uses the button/F6 and needs no restart. Legacy protocol 1 publishers
+remain supported for additions only; update both projects for edit/reset support.
+Kinematic replay preserves the requested poses, including floating designs the
+editor permits. `--physical` separately enables free rigid bodies to assess
+grasp and stack stability; it has not been validated for these new edit paths.
+
+### Verify live edits
+
+Run the Python behavior suite (no Genesis initialization):
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Exercise real headless robot trajectories, staged returns/reuse, cross-table
+movement, necessary blocker handling, and reset in one Genesis scene:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -u verify_live_edits.py
+```
+
+Pass `--record outputs/live-edits.mp4` to retain a video. The OpenUp repository's
+`openup_apps/cube_stack/verify_simulation.py` additionally verifies the actual
+C++ publisher and this receiver over TCP, with optional `--robot` integration.
 
 ## Third-party robot assets
 

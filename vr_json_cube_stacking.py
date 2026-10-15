@@ -1,5 +1,5 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import time
 
@@ -9,6 +9,7 @@ from cube_stack_layout import (
     CubePlacement, TableLayout, load_table_layout, parse_table_layout,
     rotation_matrix_to_quaternion,
 )
+from cube_stack_staging import StagingArea
 
 gs = None  # Genesis is loaded only when a simulation is actually constructed.
 
@@ -21,8 +22,6 @@ SIM_DT = 0.01
 TARGET_CUBE_SIZE = 0.08
 
 CUBE_SIZE = (TARGET_CUBE_SIZE,) * 3
-LEFT_SPAWN_POSITION = (0.30, -0.42, CUBE_SIZE[2] / 2)
-RIGHT_SPAWN_POSITION = (0.30, 0.58, CUBE_SIZE[2] / 2)
 PARKED_BLOCK_ORIGIN = (2.0, 2.0, CUBE_SIZE[2] / 2)
 SPAWN_SETTLE_STEPS = 20
 TABLE_LINE_WIDTH = 0.004
@@ -69,6 +68,20 @@ LEFT_ARM_HOME_QPOS = np.array([-0.7165, -1.0068, 1.4604, -0.4533, 2.4254, 0.0])
 RIGHT_ARM_HOME_QPOS = np.array([0.2647, -1.0065, 1.4600, -0.4546, 0.2655, -3.1406])
 
 
+class ResetRequested(Exception):
+    """Unwind a trajectory at a simulation step for an explicit session reset."""
+
+
+@dataclass
+class PoolCube:
+    key: str
+    color: str
+    block: object
+    parked_position: tuple
+    cube_id: str | None = None
+    staging_slot: object = None
+
+
 @dataclass(frozen=True)
 class DemoOptions:
     layout: TableLayout
@@ -111,6 +124,7 @@ class ColorCubeDemo:
         self.carried_quaternion = None
         self.live_client = None
         self.live_queue = None
+        self.staging = StagingArea(self.layout, TARGET_CUBE_SIZE)
 
         global gs
         if gs is None:
@@ -123,9 +137,12 @@ class ColorCubeDemo:
         self.scene = self._create_scene()
         self.blocks = self._add_blocks()
         self.placed_placements = []
+        self.current_placements = {}
         self.left_arm, self.right_arm = self._add_rack_and_arms()
         self.recording_camera = self._add_recording_camera()
         self.scene.build()
+        if options.live:
+            self._setup_live_pool()
 
         self.left_tool = self.left_arm.get_link("tool0")
         self.right_tool = self.right_arm.get_link("tool0")
@@ -151,6 +168,7 @@ class ColorCubeDemo:
     def _add_blocks(self):
         self.scene.add_entity(gs.morphs.Plane())
         self._add_workspace_table()
+        self._add_staging_surfaces()
 
         # Every JSON cube is created before scene.build(), then parked outside the
         # workspace until its turn at the color-specific feeder.
@@ -181,6 +199,25 @@ class ColorCubeDemo:
             )
         return blocks
 
+    def _add_staging_surfaces(self):
+        """Draw three continuous color strips on each side of the table."""
+        for side in ("left", "right"):
+            positions = [self.staging.position(side, lane, column)
+                         for lane in self.staging.lanes for column in range(3)]
+            cell_depth, cell_width = self.staging.cell_footprint
+            x_min = min(position[0] for position in positions) - cell_depth / 2
+            x_max = max(position[0] for position in positions) + cell_depth / 2
+            rows = sorted({position[1] for position in positions},
+                          key=lambda y: abs(y - self.staging.center_y))
+            for color, y in zip(self.staging.colors, rows):
+                self.scene.add_entity(
+                    gs.morphs.Box(size=(x_max - x_min, cell_width, .02),
+                                  pos=((x_min + x_max) / 2, y,
+                                       self.staging.platform_height - .01),
+                                  fixed=True, collision=self.options.physical),
+                    surface=gs.surfaces.Rough(color=tuple(.45 * v for v in COLOR_RGB[color])),
+                )
+
     def _add_workspace_table(self):
         """Draw the uniformly scaled VR table footprint and its center axes."""
         center_x, center_y, _ = self.layout.workspace_center
@@ -193,7 +230,7 @@ class ColorCubeDemo:
         self.scene.add_entity(
             gs.morphs.Box(
                 size=(self.layout.workspace_depth, self.layout.workspace_width, 0.001),
-                pos=(center_x, center_y, 0.0005),
+                pos=(center_x, center_y, -0.0005),
                 fixed=True,
                 collision=False,
             ),
@@ -314,6 +351,8 @@ class ColorCubeDemo:
             queue = self.live_queue if getattr(self, "live_queue", None) is not None else self.live_client.queue
             if queue.halted:
                 raise RuntimeError(f"HALTED: {queue.halt_reason}")
+            if queue.reset_pending:
+                raise ResetRequested()
         self.scene.step()
         self.step_count += 1
         if self.carried_block is not None:
@@ -356,8 +395,8 @@ class ColorCubeDemo:
             robot.control_dofs_position(target, dofs_idx_local=dofs)
             self._step()
 
-    def _move_tool(self, robot, tool, position, steps, settle=30):
-        """Solve seeded arm-only IK, validate it, and move to the result."""
+    def _solve_tool(self, robot, tool, position, init_qpos=None):
+        """Solve arm-only IK without issuing robot commands."""
         tool_quat = (
             LEFT_TOOL_QUAT if robot is self.left_arm else RIGHT_TOOL_QUAT
         )
@@ -365,10 +404,10 @@ class ColorCubeDemo:
             link=tool,
             pos=np.asarray(position),
             quat=tool_quat,
-            init_qpos=to_numpy(robot.get_dofs_position()),
+            init_qpos=to_numpy(robot.get_dofs_position()) if init_qpos is None else init_qpos,
             dofs_idx_local=ARM_DOFS,
-            max_samples=1,
-            max_solver_iters=100,
+            max_samples=10,
+            max_solver_iters=300,
             damping=0.03,
             max_step_size=0.15,
             return_error=True,
@@ -382,15 +421,45 @@ class ColorCubeDemo:
                 f"IK failed for target {position}; pose error was {error}"
             )
 
+        return qpos
+
+    def _move_tool(self, robot, tool, position, steps, settle=30):
+        qpos = self._solve_tool(robot, tool, position)
         self._move_joints(robot, qpos[:6], ARM_DOFS, steps, settle)
 
-    def _pick_and_place(self, robot, tool, block, pick_position, placement):
+    def _transfer_height(self, pick_position, place_position):
+        heights = [pick_position[2], place_position[2]]
+        heights.extend(p.position[2] for p in self.placed_placements)
+        heights.extend(slot.position[2] for slot in self.staging.slots.values())
+        return max(heights) + GRASP_OFFSET[2] + TARGET_CUBE_SIZE / 2 + .08
+
+    def _transfer_waypoints(self, pick_position, placement):
+        pick = np.asarray(pick_position, dtype=float)
+        place = np.asarray(placement.position, dtype=float)
+        height = self._transfer_height(pick, place)
+        rise = pick + HOVER_OFFSET
+        over = np.array((place[0], place[1], height))
+        midpoint = (rise + over) / 2
+        midpoint[2] = height
+        clearance = STACK_RELEASE_CLEARANCE if place[2] > TARGET_CUBE_SIZE else RELEASE_CLEARANCE
+        return (pick + HOVER_OFFSET, pick + GRASP_OFFSET, rise,
+                midpoint, over, place + GRASP_OFFSET + clearance,
+                place + HOVER_OFFSET)
+
+    def _pick_and_place(self, robot, tool, block, pick_position, placement, joint_plan=None):
         pick_position = np.asarray(pick_position)
         place_position = np.asarray(placement.position)
+        if joint_plan is None:
+            joint_plan = self._transfer_plan(robot, tool, pick_position, placement)
+        if joint_plan is None:
+            raise RuntimeError(f"Unreachable pick-and-place for {placement.cube_id}")
+
+        def go(index, steps):
+            self._move_joints(robot, joint_plan[index][:6], ARM_DOFS, steps)
 
         # Approach and retreat vertically; transfer only after the object is clear.
-        self._move_tool(robot, tool, pick_position + HOVER_OFFSET, steps=120)
-        self._move_tool(robot, tool, pick_position + GRASP_OFFSET, steps=90)
+        go(0, 120)
+        go(1, 90)
         self._move_joints(
             robot,
             [GRIPPER_CLOSED],
@@ -403,31 +472,9 @@ class ColorCubeDemo:
             self.carried_tool = tool
             self.carried_quaternion = placement.quaternion
 
-        self._move_tool(robot, tool, pick_position + HOVER_OFFSET, steps=100)
-        transfer_distance = np.linalg.norm((place_position - pick_position)[:2])
-        if transfer_distance > 0.35:
-            # A center waypoint keeps long side-to-side moves slow enough that the
-            # cube cannot slip from the gripper during peak acceleration.
-            transfer_midpoint = (pick_position + place_position) / 2
-            transfer_midpoint[2] = max(pick_position[2], place_position[2])
-            self._move_tool(
-                robot,
-                tool,
-                transfer_midpoint + HOVER_OFFSET,
-                steps=140,
-            )
-            self._move_tool(robot, tool, place_position + HOVER_OFFSET, steps=140)
-        else:
-            self._move_tool(robot, tool, place_position + HOVER_OFFSET, steps=180)
-        # Release just above the requested pose so the fingertips stay clear of the
-        # support while gravity only has to settle the final 5 mm in Genesis.
-        clearance = (
-            STACK_RELEASE_CLEARANCE
-            if place_position[2] > TARGET_CUBE_SIZE
-            else RELEASE_CLEARANCE
-        )
-        release_position = place_position + GRASP_OFFSET + clearance
-        self._move_tool(robot, tool, release_position, steps=100)
+        for index in range(2, 5):
+            go(index, 140)
+        go(5, 100)
         if not self.options.physical:
             block.set_pos(place_position, zero_velocity=True)
             block.set_quat(placement.quaternion, zero_velocity=True)
@@ -441,7 +488,7 @@ class ColorCubeDemo:
             steps=60,
             settle=50,
         )
-        self._move_tool(robot, tool, place_position + HOVER_OFFSET, steps=100)
+        go(6, 100)
 
     def _park(self, robot, home_qpos):
         self._move_joints(robot, home_qpos, ARM_DOFS, steps=180, settle=30)
@@ -475,11 +522,321 @@ class ColorCubeDemo:
             return self.right_arm, self.right_tool, RIGHT_ARM_HOME_QPOS
         return self.left_arm, self.left_tool, LEFT_ARM_HOME_QPOS
 
+    def _setup_live_pool(self):
+        self.staging = StagingArea(self.layout, TARGET_CUBE_SIZE)
+        self.pool_cubes = {
+            key: PoolCube(key, key.rsplit("_", 1)[0], block, tuple(to_numpy(block.get_pos())))
+            for key, block in self.blocks.items()
+        }
+        self.blocks = {}
+        self.current_placements = {}
+        self.placed_placements = []
+
+    @staticmethod
+    def _same_pose(first, second):
+        return (np.allclose(first.position, second.position, atol=1e-5, rtol=0)
+                and abs(np.dot(first.quaternion, second.quaternion)) > 1 - 1e-6)
+
+    def _remember(self, placement):
+        self.current_placements[placement.cube_id] = placement
+        self.placed_placements = list(self.current_placements.values())
+        if self.live_queue is not None and hasattr(self.live_queue, "realized"):
+            self.live_queue.realized[placement.cube_id] = placement
+
+    def _pool_cube(self, cube_id):
+        return next((item for item in self.pool_cubes.values() if item.cube_id == cube_id), None)
+
+    def _transfer_plan(self, robot, tool, pick_position, placement):
+        actual = to_numpy(robot.get_dofs_position()).copy()
+        home = actual.copy()
+        home[:6] = LEFT_ARM_HOME_QPOS if robot is self.left_arm else RIGHT_ARM_HOME_QPOS
+        for initial in (actual, home):
+            seed = initial
+            plan = []
+            try:
+                for position in self._transfer_waypoints(pick_position, placement):
+                    seed = self._solve_tool(robot, tool, position, seed)
+                    plan.append(seed.copy())
+                return tuple(plan)
+            except RuntimeError:
+                continue
+        return None
+
+    def _can_transfer(self, robot, tool, pick_position, placement):
+        return self._transfer_plan(robot, tool, pick_position, placement) is not None
+
+    def _handoff_candidates(self, block, placement):
+        """Find free table-surface spots near its center, including tool clearance."""
+        center = np.asarray(self.layout.workspace_center, dtype=float)
+        pitch = TARGET_CUBE_SIZE + .04
+        half_diagonal = TARGET_CUBE_SIZE / np.sqrt(2)
+        # Stay in the central half of each table dimension, with the entire cube
+        # on the table even for yawed placements or unusually small workspaces.
+        x_limit = min(self.layout.workspace_depth / 4,
+                      self.layout.workspace_depth / 2 - half_diagonal)
+        y_limit = min(self.layout.workspace_width / 4,
+                      self.layout.workspace_width / 2 - half_diagonal)
+        offsets = sorted(((x, y) for x in range(-2, 3) for y in range(-2, 3)),
+                         key=lambda offset: (offset[0] ** 2 + offset[1] ** 2, offset))
+        others = {id(other): other for other in self.blocks.values() if other is not block}
+        others.update({id(item.block): item.block for item in getattr(self, "pool_cubes", {}).values()
+                       if item.block is not block})
+        # A circumscribed footprint plus 4 cm leaves room for the open gripper.
+        separation = 2 * half_diagonal + .04
+        for x, y in offsets:
+            dx, dy = x * pitch, y * pitch
+            if abs(dx) > x_limit or abs(dy) > y_limit:
+                continue
+            position = center + (dx, dy, TARGET_CUBE_SIZE / 2)
+            if any(np.linalg.norm(to_numpy(other.get_pos())[:2] - position[:2]) < separation
+                   for other in others.values()):
+                continue
+            yield replace(placement, position=tuple(float(value) for value in position))
+
+    def _transfer_block(self, block, placement):
+        """Transfer directly, or set down near table center for the other arm."""
+        source = to_numpy(block.get_pos())
+        arms = [(self.left_arm, self.left_tool, LEFT_ARM_HOME_QPOS),
+                (self.right_arm, self.right_tool, RIGHT_ARM_HOME_QPOS)]
+        if source[1] >= 0:
+            arms.reverse()
+        try:
+            for robot, tool, home in arms:
+                plan = self._transfer_plan(robot, tool, source, placement)
+                if plan is not None:
+                    self._pick_and_place(robot, tool, block, source, placement, plan)
+                    self._park(robot, home)
+                    return
+            for relay in self._handoff_candidates(block, placement):
+                for first in arms:
+                    first_plan = self._transfer_plan(first[0], first[1], source, relay)
+                    if first_plan is None:
+                        continue
+                    for second in reversed(arms):
+                        if second[0] is first[0]:
+                            continue
+                        second_plan = self._transfer_plan(second[0], second[1], relay.position, placement)
+                        if second_plan is None:
+                            continue
+                        self._pick_and_place(first[0], first[1], block, source, relay, first_plan)
+                        self._park(first[0], first[2])
+                        self._pick_and_place(second[0], second[1], block, relay.position, placement, second_plan)
+                        self._park(second[0], second[2])
+                        return
+            raise RuntimeError(f"No reachable robot transfer for {placement.cube_id}: "
+                               f"{tuple(source)} -> {placement.position}")
+        finally:
+            self.carried_block = self.carried_tool = self.carried_quaternion = None
+
+    def _staging_target(self, item, slot):
+        return CubePlacement(item.cube_id or item.key, item.color, (0, 0, 0),
+                             slot.position, tuple(float(v) for v in to_numpy(item.block.get_quat())))
+
+    def _ensure_staging_access(self, item):
+        """Unstack supply cubes with the robot before picking a buried object."""
+        while not self.staging.is_top(item.key):
+            blocker = self.pool_cubes[self.staging.top_above(item.key)]
+            previous = blocker.staging_slot
+            self.staging.release(blocker.key)
+            slot = self.staging.reserve(blocker.key, blocker.color, previous.side,
+                                        exclude_column=previous.column, exclude_lane=previous.lane)
+            blocker.staging_slot = slot
+            target = self._staging_target(blocker, slot)
+            self._transfer_block(blocker.block, target)
+            if blocker.cube_id is not None:
+                self._remember(target)
+
+    def _stage_live_cube(self, cube_id):
+        item = self._pool_cube(cube_id)
+        if item is None or item.staging_slot is not None:
+            return
+        side = "right" if to_numpy(item.block.get_pos())[1] >= 0 else "left"
+        slot = self.staging.reserve(item.key, item.color, side)
+        item.staging_slot = slot
+        target = self._staging_target(item, slot)
+        self._transfer_block(item.block, target)
+        self._remember(target)
+
+    def _restore_staged_cube(self, target):
+        item = self._pool_cube(target.cube_id)
+        self._ensure_staging_access(item)
+        self._transfer_block(item.block, target)
+        self.staging.release(item.key)
+        item.staging_slot = None
+        self._remember(target)
+
+    def _detach_returned_cube(self, cube_id):
+        item = self._pool_cube(cube_id)
+        if item is not None:
+            item.cube_id = None
+        self.blocks.pop(cube_id, None)
+        self.current_placements.pop(cube_id, None)
+        self.placed_placements = list(self.current_placements.values())
+        if self.live_queue is not None and hasattr(self.live_queue, "realized"):
+            self.live_queue.realized.pop(cube_id, None)
+
+    @staticmethod
+    def _footprints_overlap(first_position, first_quaternion, second_position, second_quaternion):
+        def axes(quaternion):
+            w, x, y, z = quaternion
+            angle = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+            return (np.array((np.cos(angle), np.sin(angle))),
+                    np.array((-np.sin(angle), np.cos(angle))))
+        first_axes, second_axes = axes(first_quaternion), axes(second_quaternion)
+        delta = np.asarray(second_position[:2]) - first_position[:2]
+        for axis in (*first_axes, *second_axes):
+            limit = TARGET_CUBE_SIZE / 2 * sum(abs(np.dot(axis, basis))
+                                               for basis in (*first_axes, *second_axes))
+            if abs(np.dot(delta, axis)) >= limit - 1e-5:
+                return False
+        return True
+
+    def _destination_occupants(self, target):
+        return {cube_id for cube_id, block in self.blocks.items()
+                if (cube_id != target.cube_id
+                    and abs(to_numpy(block.get_pos())[2] - target.position[2]) < TARGET_CUBE_SIZE - 1e-5
+                    and self._footprints_overlap(target.position, target.quaternion,
+                                                 to_numpy(block.get_pos()), to_numpy(block.get_quat())))}
+
+    def _stack_blockers(self, cube_ids):
+        affected = set(cube_ids)
+        while True:
+            additional = set()
+            for cube_id in affected:
+                source = to_numpy(self.blocks[cube_id].get_pos())
+                for other_id, block in self.blocks.items():
+                    if other_id in affected:
+                        continue
+                    other = to_numpy(block.get_pos())
+                    if (other[2] > source[2] + 1e-5
+                            and self._footprints_overlap(source, to_numpy(self.blocks[cube_id].get_quat()),
+                                                         other, to_numpy(block.get_quat()))):
+                        additional.add(other_id)
+            if not additional:
+                return affected
+            affected.update(additional)
+
+    def _ready_to_restore(self, target, desired):
+        for support in desired.values():
+            if (support.position[2] < target.position[2] - 1e-5
+                    and np.all(np.abs(np.asarray(support.position[:2]) - target.position[:2])
+                               < TARGET_CUBE_SIZE - 1e-5)):
+                actual = self.current_placements.get(support.cube_id)
+                if actual is None or not self._same_pose(actual, support):
+                    return False
+        return True
+
+    def _restore_ready_targets(self, cube_ids, desired):
+        pending = {key for key in set(cube_ids) & desired.keys()
+                   if self._pool_cube(key) is not None
+                   and self._pool_cube(key).staging_slot is not None}
+        while pending:
+            ready = [desired[key] for key in pending
+                     if self._ready_to_restore(desired[key], desired)]
+            if not ready:
+                return  # New supports still queued; realized staging poses retain this work.
+            def order(target):
+                item = self._pool_cube(target.cube_id)
+                return (target.position[2], not self.staging.is_top(item.key),
+                        -item.staging_slot.level, target.cube_id)
+            target = min(ready, key=order)
+            self._restore_staged_cube(target)
+            pending.remove(target.cube_id)
+
+    def _resolve_obstruction(self, cube_id, desired, protected, deferred):
+        target = desired.get(cube_id)
+        current = self.current_placements[cube_id]
+        if (target is not None and not self._same_pose(current, target)
+                and self._ready_to_restore(target, desired)
+                and self._try_direct_move(target, desired, protected, deferred)):
+            return
+        # A protected upper cube can create a genuine support cycle. Clear it
+        # before attempting to pick its support, even when direct relocation
+        # cannot yet finish. Ordinary requested moves never take this path.
+        above = self._stack_blockers({cube_id}) - {cube_id}
+        for upper_id in sorted(above, key=lambda key: self.blocks[key].get_pos()[2], reverse=True):
+            self._stage_live_cube(upper_id)
+            deferred.add(upper_id)
+        if (above and target is not None and not self._same_pose(self.current_placements[cube_id], target)
+                and self._ready_to_restore(target, desired)
+                and self._try_direct_move(target, desired, protected, deferred)):
+            return
+        self._stage_live_cube(cube_id)
+        deferred.add(cube_id)
+
+    def _try_direct_move(self, target, desired, protected, deferred):
+        cube_id = target.cube_id
+        current = self.current_placements.get(cube_id)
+        if current is None:
+            return False
+        if self._same_pose(current, target):
+            return True
+        blockers = (self._stack_blockers({cube_id}) - {cube_id}) | self._destination_occupants(target)
+        if blockers & protected:
+            return False  # A swap must clear the other cube without staging this request.
+        protected = protected | {cube_id}
+        for blocker_id in sorted(blockers, key=lambda key: self.blocks[key].get_pos()[2], reverse=True):
+            remaining = (self._stack_blockers({cube_id}) - {cube_id}) | self._destination_occupants(target)
+            if blocker_id not in remaining:
+                continue
+            self._resolve_obstruction(blocker_id, desired, protected, deferred)
+        item = self._pool_cube(cube_id)
+        if item.staging_slot is not None:
+            self._restore_staged_cube(target)
+        else:
+            self._transfer_block(item.block, target)
+            self._remember(target)
+        return True
+
+    def move_live_cube(self, placement):
+        """Pick the requested cube at its current pose and place it directly."""
+        current = self.current_placements.get(placement.cube_id)
+        if current is None or self._same_pose(current, placement):
+            return
+        desired = dict(self.current_placements)
+        if self.live_queue is not None:
+            desired = {p.cube_id: p for p in self.live_queue.layout.placements}
+        desired[placement.cube_id] = placement
+        deferred = set()
+        if not self._try_direct_move(placement, desired, set(), deferred):
+            raise RuntimeError(f"Cannot clear destination for {placement.cube_id}")
+        self._restore_ready_targets(deferred, desired)
+        for cube_id in deferred - desired.keys():
+            self._detach_returned_cube(cube_id)
+
+    def delete_live_cube(self, placement):
+        if placement.cube_id not in self.blocks:
+            return
+        desired = dict(self.current_placements)
+        if self.live_queue is not None:
+            desired = {p.cube_id: p for p in self.live_queue.layout.placements}
+        desired.pop(placement.cube_id, None)
+        affected = self._stack_blockers({placement.cube_id})
+        for cube_id in sorted(affected, key=lambda key: self.blocks[key].get_pos()[2], reverse=True):
+            self._stage_live_cube(cube_id)
+        for cube_id in affected - desired.keys():
+            self._detach_returned_cube(cube_id)
+        self._restore_ready_targets(affected, desired)
+
+    def reset_live_scene(self):
+        """Reset entities and arm controllers in the already built Genesis scene."""
+        self.carried_block = self.carried_tool = self.carried_quaternion = None
+        for item in self.pool_cubes.values():
+            item.block.set_pos(item.parked_position, zero_velocity=True)
+            item.block.set_quat((1, 0, 0, 0), zero_velocity=True)
+            item.cube_id = None
+            item.staging_slot = None
+        self.blocks.clear()
+        self.current_placements.clear()
+        self.placed_placements.clear()
+        self.staging.clear()
+        self._initialize_poses()
+
     def _spawn_block(self, block, placement, robot):
-        """Move the next parked block to the selected arm's side feeder."""
-        spawn_position = (
-            RIGHT_SPAWN_POSITION if robot is self.right_arm else LEFT_SPAWN_POSITION
-        )
+        """Create a new supply cube in staging before its first robot pickup."""
+        side = "right" if robot is self.right_arm else "left"
+        slot = self.staging.reserve(placement.cube_id, placement.color_name, side)
+        spawn_position = slot.position
         block.set_pos(spawn_position, zero_velocity=True)
         block.set_quat(placement.quaternion, zero_velocity=True)
         for _ in range(self._scaled_steps(SPAWN_SETTLE_STEPS)):
@@ -493,20 +850,54 @@ class ColorCubeDemo:
 
     def place_live_cube(self, placement):
         """Execute one arbitrary imported pose; the caller owns queue ordering."""
+        deferred = set()
+        desired = {}
         try:
-            robot, tool, home = self._arm_for_placement(placement)
-            block = self.blocks[placement.cube_id]
-            spawn_position = self._spawn_block(block, placement, robot)
-
-            self._pick_and_place(
-                robot,
-                tool,
-                block,
-                spawn_position,
-                placement,
-            )
-            self._park(robot, home)
-            self.placed_placements.append(placement)
+            if self.options.live:
+                if placement.cube_id in self.blocks:
+                    self.move_live_cube(placement)
+                    return
+                desired = dict(self.current_placements)
+                if self.live_queue is not None:
+                    desired = {p.cube_id: p for p in self.live_queue.layout.placements}
+                desired[placement.cube_id] = placement
+                for cube_id in sorted(self._destination_occupants(placement),
+                                      key=lambda key: self.blocks[key].get_pos()[2], reverse=True):
+                    if cube_id not in self._destination_occupants(placement):
+                        continue
+                    self._resolve_obstruction(cube_id, desired, {placement.cube_id}, deferred)
+                supplies = [item for item in self.pool_cubes.values()
+                            if item.color == placement.color_name and item.cube_id is None]
+                if not supplies:
+                    raise RuntimeError(f"No reusable {placement.color_name} supply cube")
+                side = "right" if placement.position[1] >= 0 else "left"
+                supplies.sort(key=lambda item: (item.staging_slot is None,
+                                               item.staging_slot is not None and item.staging_slot.side != side,
+                                               item.staging_slot is not None and not self.staging.is_top(item.key)))
+                item = supplies[0]
+                if item.staging_slot is None:
+                    item.staging_slot = self.staging.reserve(item.key, item.color, side)
+                    item.block.set_pos(item.staging_slot.position, zero_velocity=True)
+                    item.block.set_quat(placement.quaternion, zero_velocity=True)
+                    for _ in range(self._scaled_steps(SPAWN_SETTLE_STEPS)):
+                        self._step()
+                self._ensure_staging_access(item)
+                item.cube_id = placement.cube_id
+                self.blocks[placement.cube_id] = item.block
+                self._transfer_block(item.block, placement)
+                self.staging.release(item.key)
+                item.staging_slot = None
+            else:
+                robot, _, _ = self._arm_for_placement(placement)
+                block = self.blocks[placement.cube_id]
+                self._spawn_block(block, placement, robot)
+                self._transfer_block(block, placement)
+                self.staging.release(placement.cube_id)
+            self._remember(placement)
+            if deferred:
+                self._restore_ready_targets(deferred, desired)
+                for cube_id in deferred - desired.keys():
+                    self._detach_returned_cube(cube_id)
         finally:
             # Never allow a failed partial move to keep moving a carried cube.
             self.carried_block = None
@@ -524,13 +915,24 @@ class ColorCubeDemo:
                 client.pump()
                 if queue.halted:
                     raise RuntimeError(f"HALTED: {queue.halt_reason}")
-                placement = queue.start_next()
-                if placement is None:
-                    self._step()
-                    time.sleep(SIM_DT)
-                    continue
-                self.place_live_cube(placement)
-                queue.complete_active()
+                command = queue.start_next()
+                try:
+                    if command is None:
+                        self._step()
+                        time.sleep(SIM_DT)
+                        continue
+                    if command.kind == "reset":
+                        self.reset_live_scene()
+                    elif command.kind == "add":
+                        self.place_live_cube(command.placement)
+                    elif command.kind == "move":
+                        self.move_live_cube(command.placement)
+                    elif command.kind == "delete":
+                        self.delete_live_cube(command.placement)
+                    queue.complete_active()
+                except ResetRequested:
+                    self.carried_block = self.carried_tool = self.carried_quaternion = None
+                    queue.cancel_active_for_reset()
         except BaseException as error:
             queue.fail_active(str(error) or type(error).__name__)
             self.carried_block = self.carried_tool = self.carried_quaternion = None
@@ -671,7 +1073,7 @@ def parse_args(argv=None):
         ),
     )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--live", action="store_true", help="receive append-only CubeStack/Map snapshots and place cubes continuously")
+    mode.add_argument("--live", action="store_true", help="follow CubeStack/Map additions, moves, deletions and session resets with robot pick-and-place")
     mode.add_argument("--receive-only", action="store_true", help="validate/queue real live maps without importing Genesis or moving robots")
     parser.add_argument("--host", default="127.0.0.1", help="OpenUp table host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=9036, help="OpenUp simulation stream port (default: 9036)")
