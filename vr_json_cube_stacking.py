@@ -7,7 +7,7 @@ import numpy as np
 
 from cube_stack_layout import (
     CubePlacement, TableLayout, load_table_layout, parse_table_layout,
-    rotation_matrix_to_quaternion,
+    placements_share_pose, rotation_matrix_to_quaternion,
 )
 from cube_stack_staging import StagingArea
 
@@ -534,14 +534,26 @@ class ColorCubeDemo:
 
     @staticmethod
     def _same_pose(first, second):
-        return (np.allclose(first.position, second.position, atol=1e-5, rtol=0)
-                and abs(np.dot(first.quaternion, second.quaternion)) > 1 - 1e-6)
+        return placements_share_pose(first, second)
 
     def _remember(self, placement):
         self.current_placements[placement.cube_id] = placement
         self.placed_placements = list(self.current_placements.values())
         if self.live_queue is not None and hasattr(self.live_queue, "realized"):
             self.live_queue.realized[placement.cube_id] = placement
+
+    def _sample_physical_state(self, queue):
+        """Replace command targets with measured bodies at a safe boundary."""
+        if not getattr(self.options, "physical", False):
+            return
+        self.current_placements = {
+            cube_id: replace(placement,
+                             position=tuple(float(v) for v in to_numpy(self.blocks[cube_id].get_pos())),
+                             quaternion=tuple(float(v) for v in to_numpy(self.blocks[cube_id].get_quat())))
+            for cube_id, placement in self.current_placements.items()
+        }
+        self.placed_placements = list(self.current_placements.values())
+        queue.realized = dict(self.current_placements)
 
     def _pool_cube(self, cube_id):
         return next((item for item in self.pool_cubes.values() if item.cube_id == cube_id), None)
@@ -667,6 +679,11 @@ class ColorCubeDemo:
 
     def _detach_returned_cube(self, cube_id):
         item = self._pool_cube(cube_id)
+        if item is not None and self.options.physical:
+            actual = to_numpy(item.block.get_pos())
+            if (item.staging_slot is None or
+                    np.linalg.norm(actual - item.staging_slot.position) > TARGET_CUBE_SIZE / 8):
+                raise RuntimeError(f"Physical return did not remove {cube_id} to staging")
         if item is not None:
             item.cube_id = None
         self.blocks.pop(cube_id, None)
@@ -915,9 +932,12 @@ class ColorCubeDemo:
                 client.pump()
                 if queue.halted:
                     raise RuntimeError(f"HALTED: {queue.halt_reason}")
+                if not queue.reset_pending:
+                    self._sample_physical_state(queue)
                 command = queue.start_next()
                 try:
                     if command is None:
+                        client.publish_robot_state()
                         self._step()
                         time.sleep(SIM_DT)
                         continue
@@ -930,6 +950,8 @@ class ColorCubeDemo:
                     elif command.kind == "delete":
                         self.delete_live_cube(command.placement)
                     queue.complete_active()
+                    self._sample_physical_state(queue)
+                    client.publish_robot_state()
                 except ResetRequested:
                     self.carried_block = self.carried_tool = self.carried_quaternion = None
                     queue.cancel_active_for_reset()

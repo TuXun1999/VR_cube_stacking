@@ -13,7 +13,11 @@ import socket
 import struct
 import time
 
-from cube_stack_layout import CubePlacement, parse_table_layout
+import numpy as np
+
+from cube_stack_layout import (
+    CubePlacement, VR_TO_GENESIS_AXES, parse_table_layout, placements_share_pose,
+)
 
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 
@@ -268,7 +272,9 @@ class LiveMapQueue:
         desired = self._desired()
         removed = [placement for cube_id, placement in realized.items() if cube_id not in desired]
         materialized = [placement for cube_id, placement in desired.items()
-                        if cube_id not in realized or placement != realized[cube_id]]
+                        if (cube_id not in realized or
+                            placement.color_name != realized[cube_id].color_name or
+                            not placements_share_pose(placement, realized[cube_id]))]
         removed.sort(key=lambda placement: -placement.position[2])
         # New support cubes and moves share one bottom-up order. Sorting keeps
         # the producer's order for equal-height targets regardless of kind.
@@ -303,6 +309,37 @@ class LiveMapQueue:
         self.report(f"completed: {command.kind} {command.cube_id}")
         self.active = None
 
+    def robot_state(self):
+        """A completed actual scene, available only between robot operations.
+
+        The latest accepted revision identifies the desired map this result was
+        checked against. Actual poses may still differ from it when an older
+        transfer just finished; consumers must compare each cube's target.
+        """
+        if (self.halted or self.protocol_version != 2 or self.layout is None
+                or self.active is not None or self.reset_pending):
+            return None
+        cubes = []
+        for cube_id, placement in sorted(self.realized.items()):
+            position = (VR_TO_GENESIS_AXES.T @
+                        (np.asarray(placement.position) - self.layout.workspace_center)
+                        / self.layout.scale)
+            w, x, y, z = placement.quaternion
+            rotation = np.array([
+                [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
+                [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
+                [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
+            ])
+            transform = np.eye(4)
+            transform[:3, :3] = (VR_TO_GENESIS_AXES.T @ rotation @
+                                 VR_TO_GENESIS_AXES) * self.layout.source_cube_size
+            transform[:3, 3] = position
+            cubes.append({"id": cube_id, "color": placement.color_name,
+                          "position": position.tolist(),
+                          "object_to_table": transform.ravel().tolist()})
+        return {"session_id": self.session_id, "revision": self.revision,
+                "reset_generation": self._acknowledged_generation, "cubes": cubes}
+
     def cancel_active_for_reset(self):
         """Forget an interrupted operation only when a whole-pool reset follows."""
         if not self.reset_pending:
@@ -319,7 +356,7 @@ class LiveMapQueue:
 
 
 class LiveStreamClient:
-    """Nonblocking TCP receiver with bounded pumps and persistent acceptance."""
+    """Nonblocking map receiver and completed-state sender on the same socket."""
 
     def __init__(self, queue, host="127.0.0.1", port=9036, retry_interval=0.5, report=print):
         if not 0 < port < 65536:
@@ -334,6 +371,13 @@ class LiveStreamClient:
         self.connect_deadline = 0.0
         self.decoder = FrameDecoder()
         self._last_connection_error = None
+        self._robot_sequence = 0
+        self._robot_pending = b""
+        self._robot_sent = 0
+        self._robot_waiting = None
+        self._last_robot_payload = None
+        self._last_robot_publish = 0.0
+        self._received_map_on_connection = False
 
     def close(self):
         if self.socket is not None:
@@ -341,6 +385,11 @@ class LiveStreamClient:
             self.socket = None
         self.connecting = False
         self.decoder = FrameDecoder()  # discard only this connection's partial frame
+        self._robot_pending = b""
+        self._robot_sent = 0
+        self._robot_waiting = None
+        self._last_robot_payload = None
+        self._received_map_on_connection = False
 
     def _disconnected(self, reason):
         self.close()
@@ -389,8 +438,61 @@ class LiveStreamClient:
                     self.queue.accept(header, data)
                     if self.queue.halted:
                         return
+                    self._received_map_on_connection = True
         except ProtocolError as error:
             self.queue.halt(error)
             self.close()
+        except OSError as error:
+            self._disconnected(str(error))
+
+    def publish_robot_state(self):
+        """Send actual completed state from an outer robot-loop boundary only.
+
+        Receiving/pumping never calls this: receive-only diagnostics and
+        trajectory steps cannot acknowledge work. At most one frame in flight
+        and the newest waiting state are retained, including partial writes.
+        """
+        state = self.queue.robot_state()
+        if (state is None or self.socket is None or self.connecting
+                or not self._received_map_on_connection):
+            return
+        now = time.monotonic()
+        payload = json.dumps(state, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(payload) > MAX_FRAME_BYTES:
+            self.queue.halt("RobotState exceeds 64 MiB limit")
+            return
+        if payload != self._last_robot_payload or now - self._last_robot_publish >= .5:
+            self._robot_waiting = payload
+            self._last_robot_payload = payload
+            self._last_robot_publish = now
+        try:
+            for _ in range(16):
+                if not self._robot_pending:
+                    if self._robot_waiting is None:
+                        return
+                    body = self._robot_waiting
+                    self._robot_waiting = None
+                    self._robot_sequence += 1
+                    message = {
+                        "stream": "CubeStack/RobotState", "content_type": "application/json",
+                        "sequence": self._robot_sequence, "payload_bytes": len(body),
+                        "timestamp": now,
+                        "metadata": json.dumps({"protocol_version": 2,
+                                                "session_id": self.queue.session_id}),
+                    }
+                    encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
+                    self._robot_pending = (struct.pack("<I", len(encoded)) + encoded
+                                           + struct.pack("<I", len(body)) + body)
+                    self._robot_sent = 0
+                try:
+                    count = self.socket.send(memoryview(self._robot_pending)[self._robot_sent:])
+                except BlockingIOError:
+                    return
+                if count == 0:
+                    raise OSError("publisher disconnected while sending RobotState")
+                self._robot_sent += count
+                if self._robot_sent == len(self._robot_pending):
+                    self._robot_pending = b""
+                    self._robot_sent = 0
         except OSError as error:
             self._disconnected(str(error))

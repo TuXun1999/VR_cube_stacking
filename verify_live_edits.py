@@ -11,7 +11,75 @@ from types import SimpleNamespace
 import numpy as np
 
 from cube_stack_layout import CubePlacement, parse_table_layout
+from cube_stack_stream import LiveMapQueue
 from vr_json_cube_stacking import ColorCubeDemo, DemoOptions, ResetRequested, to_numpy
+
+
+def verify_completed_robot_state(demo, source):
+    """Compare protocol acknowledgements with actual finished Genesis work."""
+    demo.live_client = demo.live_queue = None
+    demo.reset_live_scene()
+    queue = LiveMapQueue(report=lambda message: None)
+    demo.live_queue = queue
+    cube_size = source["cube_size"]
+
+    def record(cube_id, x, z):
+        y = cube_size / 2
+        return {"id": cube_id, "color": "blue", "position": [x, y, z],
+                "object_to_table": [cube_size, 0, 0, x, 0, cube_size, 0, y,
+                                    0, 0, cube_size, z, 0, 0, 0, 1]}
+
+    def accept(cubes, revision, generation=0):
+        data = dict(source, cubes=cubes, revision=revision, reset_generation=generation)
+        header = dict(stream="CubeStack/Map", content_type="application/json", sequence=revision,
+                      payload_bytes=len(json.dumps(data).encode("utf-8")), timestamp=0.,
+                      metadata=json.dumps(dict(protocol_version=2, session_id="genesis-robot-state")))
+        assert queue.accept(header, data) >= 0, queue.halt_reason
+
+    def completed(command, expected, revision, generation=0):
+        assert queue.robot_state() is None, "An active operation was acknowledged early"
+        queue.complete_active()
+        state = queue.robot_state()
+        assert state["revision"] == revision and state["reset_generation"] == generation, state
+        assert [cube["id"] for cube in state["cubes"]] == [cube["id"] for cube in expected], state
+        for actual, wanted in zip(state["cubes"], expected):
+            assert actual["color"] == wanted["color"], actual
+            np.testing.assert_allclose(actual["position"], wanted["position"], atol=1e-8)
+            np.testing.assert_allclose(actual["object_to_table"], wanted["object_to_table"], atol=1e-8)
+            placement = queue.realized[actual["id"]]
+            np.testing.assert_allclose(to_numpy(demo.blocks[actual["id"]].get_pos()),
+                                       placement.position, atol=1e-4)
+        print(f"verified: RobotState after actual {command.kind}: revision={revision} "
+              f"generation={generation} cubes={len(expected)}", flush=True)
+
+    try:
+        first = record("ack_cube", .2, -.05)
+        moved = record("ack_cube", -.2, .05)
+        accept([first], 1)
+        command = queue.start_next()
+        # Receive a newer target while the old immutable command is active.
+        accept([moved], 2)
+        demo.place_live_cube(command.placement)
+        completed(command, [first], 2)
+        command = queue.start_next()
+        demo.move_live_cube(command.placement)
+        completed(command, [moved], 2)
+        accept([], 3)
+        command = queue.start_next()
+        demo.delete_live_cube(command.placement)
+        completed(command, [], 3)
+        accept([], 4, 1)
+        assert queue.robot_state() is None, "Reset was acknowledged before the pool reset"
+        command = queue.start_next()
+        demo.reset_live_scene()
+        completed(command, [], 4, 1)
+        fresh = record("after_reset_ack", .1, 0.)
+        accept([fresh], 5, 1)
+        command = queue.start_next()
+        demo.place_live_cube(command.placement)
+        completed(command, [fresh], 5, 1)
+    finally:
+        demo.live_queue = None
 
 
 def main(record=None):
@@ -143,6 +211,7 @@ def main(record=None):
                         assert any(demo._can_transfer(arm, tool, source, high)
                                    for arm, tool in arms), (side, color, column, high.position)
         print("verified: all lateral staging cells reachable at default balanced 90-return capacity", flush=True)
+        verify_completed_robot_state(demo, data)
     finally:
         demo._stop_recording(settle=False)
     print("Genesis live edits: all checks passed", flush=True)

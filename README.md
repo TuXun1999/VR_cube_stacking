@@ -266,6 +266,20 @@ transfer finishes to a known pose before following newer edits. Held-drag
 previews are not robot targets. Repeated snapshots and reconnection to the
 same publisher do not duplicate work.
 
+The live robot returns `CubeStack/RobotState` frames on the same TCP connection
+after completed operations and while idle, with a 500 ms status heartbeat.
+Their JSON payload contains `session_id`, `reset_generation`, the latest accepted
+map `revision`, and `cubes` with actual completed `id`, `color`, `position`, and
+row-major `object_to_table` values in the original table coordinates. A newer
+map may already be queued, so a receiver must match each actual pose with its
+current target before confirming it. Missing IDs confirm removal, including
+births cancelled before the robot started them. Active trajectories and pending
+resets send no completion status; receive-only diagnostics send none at all.
+Reconnect replays the latest completed state without duplicating robot work.
+Experimental physical mode samples body positions and orientations at these
+boundaries, so missed targets remain unconfirmed. A failed physical return to
+staging halts before reporting the deleted ID as absent.
+
 The publisher sends complete `CubeStack/Map` snapshots after edits and every
 500 ms while subscribed. New cubes may be added while the robot is working.
 Moving the desktop camera and choosing the color of future cubes are supported.
@@ -336,7 +350,8 @@ Run the Python behavior suite (no Genesis initialization):
 ```
 
 Exercise real headless robot trajectories, staged returns/reuse, cross-table
-movement, necessary blocker handling, and reset in one Genesis scene:
+movement, necessary blocker handling, reset, and completed `RobotState` poses
+for add/move/delete/reset in one Genesis scene:
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -u verify_live_edits.py

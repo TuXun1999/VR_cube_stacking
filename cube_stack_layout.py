@@ -28,6 +28,12 @@ class CubePlacement:
     quaternion: tuple[float, float, float, float]
 
 
+def placements_share_pose(first, second):
+    """Use the same pose tolerance for reconciliation and robot execution."""
+    return (np.allclose(first.position, second.position, atol=1e-5, rtol=0)
+            and abs(np.dot(first.quaternion, second.quaternion)) > 1 - 1e-6)
+
+
 @dataclass(frozen=True)
 class TableLayout:
     source_path: Path
