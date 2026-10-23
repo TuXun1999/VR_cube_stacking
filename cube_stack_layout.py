@@ -1,6 +1,6 @@
-"""Genesis-free V2 table-map parsing shared by file and live replay."""
+"""Genesis-free table-map parsing shared by file and live replay."""
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -26,6 +26,68 @@ class CubePlacement:
     source_position: tuple[float, float, float]
     position: tuple[float, float, float]
     quaternion: tuple[float, float, float, float]
+    piece_id: str = ""
+    piece_index: int = 0
+    piece_size: int = 1
+
+
+@dataclass(frozen=True)
+class PiecePlacement:
+    piece_id: str
+    color_name: str
+    members: tuple[CubePlacement, ...]
+    source_position: tuple[float, float, float]
+    position: tuple[float, float, float]
+    quaternion: tuple[float, float, float, float]
+
+    @property
+    def cube_id(self):
+        return self.piece_id
+
+    @property
+    def length(self):
+        return len(self.members)
+
+
+def quaternion_to_rotation(quaternion):
+    w, x, y, z = quaternion
+    return np.array([
+        [1 - 2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+        [2*(x*y+z*w), 1 - 2*(x*x+z*z), 2*(y*z-x*w)],
+        [2*(x*z-y*w), 2*(y*z+x*w), 1 - 2*(x*x+y*y)]])
+
+
+def as_piece(placement):
+    if isinstance(placement, PiecePlacement):
+        return placement
+    member = replace(placement, piece_id=placement.piece_id or placement.cube_id)
+    return PiecePlacement(member.piece_id, member.color_name, (member,),
+                          member.source_position, member.position, member.quaternion)
+
+
+def group_pieces(placements, cube_size=TARGET_CUBE_SIZE):
+    groups = {}
+    for member in placements:
+        groups.setdefault(member.piece_id or member.cube_id, []).append(member)
+    result = []
+    for piece_id, members in groups.items():
+        members.sort(key=lambda member: member.piece_index)
+        first = members[0]
+        if len(members) != first.piece_size or [m.piece_index for m in members] != list(range(first.piece_size)):
+            raise ValueError(f"Incomplete or duplicate members of piece {piece_id!r}")
+        rotation = quaternion_to_rotation(first.quaternion)
+        for index, member in enumerate(members):
+            if member.piece_size != len(members) or member.color_name != first.color_name:
+                raise ValueError(f"Inconsistent piece {piece_id!r} size or color")
+            if abs(np.dot(member.quaternion, first.quaternion)) < 1 - 1e-7:
+                raise ValueError(f"Inconsistent piece {piece_id!r} orientation")
+            expected = np.asarray(first.position) + rotation @ np.array([0, index * cube_size, 0])
+            if not np.allclose(member.position, expected, atol=1e-5, rtol=0):
+                raise ValueError(f"Piece {piece_id!r} members must form a straight glued bar")
+        result.append(PiecePlacement(piece_id, first.color_name, tuple(members),
+                      tuple(np.mean([m.source_position for m in members], axis=0)),
+                      tuple(np.mean([m.position for m in members], axis=0)), first.quaternion))
+    return tuple(result)
 
 
 def placements_share_pose(first, second):
@@ -45,6 +107,10 @@ class TableLayout:
     workspace_depth: float
     workspace_center: tuple[float, float, float]
     placements: tuple[CubePlacement, ...]
+
+    @property
+    def pieces(self):
+        return group_pieces(self.placements, self.source_cube_size * self.scale)
 
 
 def rotation_matrix_to_quaternion(rotation):
@@ -105,7 +171,7 @@ def load_table_layout(path, target_cube_size=TARGET_CUBE_SIZE):
 
 
 def parse_table_layout(data, target_cube_size=TARGET_CUBE_SIZE, source_path="<live>", *, require_ids=False):
-    """Validate a decoded complete V2 map and convert its right-handed frame."""
+    """Validate a decoded complete version-2 or version-3 map and convert its right-handed frame."""
     try:
         return _parse_table_layout(data, target_cube_size, Path(source_path), require_ids)
     except (KeyError, TypeError, OverflowError) as error:
@@ -115,8 +181,8 @@ def parse_table_layout(data, target_cube_size=TARGET_CUBE_SIZE, source_path="<li
 def _parse_table_layout(data, target_cube_size, path, require_ids):
     if not isinstance(data, dict):
         raise ValueError("The table map must be a JSON object.")
-    if data.get("version") != 2:
-        raise ValueError("Only openup.cube_stack.map version 2 is supported.")
+    if type(data.get("version")) is not int or data["version"] not in (2, 3):
+        raise ValueError("Only openup.cube_stack.map versions 2 and 3 are supported.")
     if data.get("coordinate_space") != "table_local":
         raise ValueError("The table map must use table_local coordinates.")
     if not math.isfinite(target_cube_size) or target_cube_size <= 0:
@@ -174,13 +240,20 @@ def _parse_table_layout(data, target_cube_size, path, require_ids):
             raise ValueError(f"Cube {cube_index} has unsupported color {color_name!r}.")
         serials[color_name] += 1
         cube_id = cube.get("id", f"{color_name}_{serials[color_name]}")
-        if require_ids and "id" not in cube:
+        if (require_ids or data["version"] == 3) and "id" not in cube:
             raise ValueError(f"Cube {cube_index} requires a stable id for live protocol 2.")
         if not isinstance(cube_id, str) or not cube_id:
             raise ValueError(f"Cube {cube_index} id must be a nonempty string.")
         if cube_id in cube_ids:
             raise ValueError(f"Duplicate cube id {cube_id!r}.")
         cube_ids.add(cube_id)
+        piece_id, piece_index, piece_size = cube_id, 0, 1
+        if data["version"] == 3:
+            piece_id, piece_index, piece_size = cube.get("piece_id"), cube.get("piece_index"), cube.get("piece_size")
+            if (not isinstance(piece_id, str) or not piece_id
+                    or type(piece_size) is not int or not 1 <= piece_size <= 3
+                    or type(piece_index) is not int or not 0 <= piece_index < piece_size):
+                raise ValueError(f"Cube {cube_index} has invalid piece membership")
 
         source_position = np.asarray(cube["position"], dtype=float)
         if source_position.shape != (3,) or not np.all(np.isfinite(source_position)):
@@ -226,6 +299,7 @@ def _parse_table_layout(data, target_cube_size, path, require_ids):
         placements.append(
             CubePlacement(
                 cube_id=cube_id,
+                piece_id=piece_id, piece_index=piece_index, piece_size=piece_size,
                 color_name=color_name,
                 source_position=tuple(float(value) for value in source_position),
                 position=tuple(float(value) for value in workspace_position),
@@ -235,6 +309,8 @@ def _parse_table_layout(data, target_cube_size, path, require_ids):
                 ),
             )
         )
+
+    group_pieces(placements, target_cube_size)  # Validate complete rigid groups before publishing any state.
 
     # Preserve the producer's order. In the example, this encodes the blue
     # structure's support dependencies before unrelated ground-level cubes.

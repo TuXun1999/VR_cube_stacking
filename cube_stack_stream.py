@@ -4,7 +4,7 @@ The client is pumped by its owner thread. It never executes robot commands.
 """
 from collections import Counter
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import json
 import math
@@ -16,8 +16,10 @@ import time
 import numpy as np
 
 from cube_stack_layout import (
-    CubePlacement, VR_TO_GENESIS_AXES, parse_table_layout, placements_share_pose,
+    CubePlacement, PiecePlacement, as_piece, VR_TO_GENESIS_AXES, parse_table_layout, placements_share_pose,
 )
+
+from cube_stack_piece_geometry import members_at_pose
 
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 
@@ -59,8 +61,8 @@ def validate_header(header):
     if not isinstance(header.get("metadata"), str):
         raise ProtocolError("metadata must be a JSON string")
     metadata = _json_object(header["metadata"], "metadata")
-    if type(metadata.get("protocol_version")) is not int or metadata["protocol_version"] not in (1, 2):
-        raise ProtocolError("Unsupported protocol_version; expected 1 or 2")
+    if type(metadata.get("protocol_version")) is not int or metadata["protocol_version"] not in (1, 2, 3):
+        raise ProtocolError("Unsupported protocol_version; expected 1, 2 or 3")
     if not isinstance(metadata.get("session_id"), str) or not metadata["session_id"]:
         raise ProtocolError("metadata session_id must be a nonempty string")
     return metadata
@@ -106,7 +108,7 @@ class LiveCommand:
     """One acknowledged robot operation; reset has no cube placement."""
 
     kind: str
-    placement: CubePlacement | None = None
+    placement: PiecePlacement | None = None
     reset_generation: int = 0
 
     @property
@@ -137,6 +139,7 @@ class LiveMapQueue:
         self.reset_generation = 0
         self._acknowledged_generation = 0
         self.realized = {}
+        self._identities = {}
         self.reserved = Counter()
         self.active = None
         self.completed_count = 0
@@ -160,7 +163,7 @@ class LiveMapQueue:
             # A reset in flight already accounts for its own generation. A
             # newer reset still needs a separate acknowledgement.
             extra_reset = int(active_reset_generation != self.reset_generation)
-            return extra_reset + self.accepted_count
+            return extra_reset + (len(self.layout.pieces) if self.layout is not None else 0)
         return len(self._commands_for(projected))
 
     @property
@@ -187,12 +190,12 @@ class LiveMapQueue:
             if self.protocol_version is not None and protocol != self.protocol_version:
                 raise ProtocolError("stream protocol changed")
             if self._accepted is not None:
-                ignored = {"cubes", "revision", "reset_generation"} if protocol == 2 else {"cubes"}
+                ignored = {"cubes", "revision", "reset_generation"} if protocol >= 2 else {"cubes"}
                 previous_metadata = {key: value for key, value in self._accepted.items() if key not in ignored}
                 current_metadata = {key: value for key, value in data.items() if key not in ignored}
                 if previous_metadata != current_metadata:
                     raise ProtocolError("table metadata changed")
-            if protocol == 2:
+            if protocol >= 2:
                 for field in ("revision", "reset_generation"):
                     if type(data.get(field)) is not int or data[field] < 0:
                         raise ProtocolError(f"{field} must be a nonnegative integer")
@@ -211,7 +214,9 @@ class LiveMapQueue:
             else:
                 revision = 0 if self.revision is None else self.revision + 1
                 generation = 0
-            layout = parse_table_layout(data, require_ids=protocol == 2)
+            if (protocol == 3) != (data.get("version") == 3):
+                raise ProtocolError("Protocol and map version disagree")
+            layout = parse_table_layout(data, require_ids=protocol >= 2)
             if protocol == 1 and self._accepted is not None:
                 previous = self._accepted["cubes"]
                 if len(data["cubes"]) < len(previous) or data["cubes"][:len(previous)] != previous:
@@ -222,9 +227,11 @@ class LiveMapQueue:
             for color, count in proposed.items():
                 if count > self.pool_per_color:
                     raise ProtocolError(f"{color} pool exhausted: needs {count}, capacity {self.pool_per_color}")
-            desired = {placement.cube_id: placement for placement in layout.placements}
+            desired = {placement.cube_id: placement for placement in layout.pieces}
             previous_desired = self._desired()
             known = dict(previous_desired)
+            if generation == self.reset_generation:
+                known.update(self._identities)
             if not self.reset_pending:
                 known.update(self.realized)
             if (self.active is not None and self.active.placement is not None
@@ -236,6 +243,16 @@ class LiveMapQueue:
                 for cube_id in desired.keys() & known.keys():
                     if desired[cube_id].color_name != known[cube_id].color_name:
                         raise ProtocolError(f"Cube {cube_id!r} changed color")
+                    if (desired[cube_id].length != known[cube_id].length or
+                            [(m.cube_id, m.piece_index) for m in desired[cube_id].members] !=
+                            [(m.cube_id, m.piece_index) for m in as_piece(known[cube_id]).members]):
+                        raise ProtocolError(f"Piece {cube_id!r} changed membership")
+                old_members = {member.cube_id: piece.cube_id for piece in known.values()
+                               for member in as_piece(piece).members}
+                for piece in desired.values():
+                    for member in piece.members:
+                        if member.cube_id in old_members and old_members[member.cube_id] != piece.cube_id:
+                            raise ProtocolError(f"Member {member.cube_id!r} changed piece")
             changed = sum(previous_desired.get(cube_id) != desired.get(cube_id)
                           for cube_id in previous_desired.keys() | desired.keys())
             # No observable queue state changes until the whole snapshot passed.
@@ -244,6 +261,9 @@ class LiveMapQueue:
             self._accepted = copy.deepcopy(data)
             self.layout = layout
             self.revision = revision
+            if generation != self.reset_generation:
+                self._identities.clear()
+            self._identities.update(desired)
             self.reset_generation = generation
             self.reserved = proposed
             self.report(f"accepted: session={self.session_id} revision={revision} reset_generation={generation} cubes={self.accepted_count} queued={self.pending_count} completed={self.completed_count}")
@@ -266,7 +286,7 @@ class LiveMapQueue:
         return self.active
 
     def _desired(self):
-        return {placement.cube_id: placement for placement in self.layout.placements} if self.layout is not None else {}
+        return {placement.cube_id: placement for placement in self.layout.pieces} if self.layout is not None else {}
 
     def _commands_for(self, realized):
         desired = self._desired()
@@ -293,10 +313,15 @@ class LiveMapQueue:
         else:
             realized[command.cube_id] = command.placement
 
-    def complete_active(self):
+    def complete_active(self, actual=None):
         if self.active is None:
             raise RuntimeError("No active command to complete")
         command = self.active
+        if actual is not None:
+            actual = as_piece(actual)
+            if command.placement is None or actual.piece_id != command.cube_id or actual.length != command.placement.length:
+                raise ValueError("Actual piece identity does not match the active command")
+            command = replace(command, placement=actual)
         self._apply_result(self.realized, command)
         if command.kind == "reset":
             self._acknowledged_generation = command.reset_generation
@@ -305,7 +330,7 @@ class LiveMapQueue:
         else:
             self.completed_command_count += 1
             if command.kind == "add":
-                self.completed_count += 1
+                self.completed_count += command.placement.length
         self.report(f"completed: {command.kind} {command.cube_id}")
         self.active = None
 
@@ -316,27 +341,31 @@ class LiveMapQueue:
         checked against. Actual poses may still differ from it when an older
         transfer just finished; consumers must compare each cube's target.
         """
-        if (self.halted or self.protocol_version != 2 or self.layout is None
+        if (self.halted or self.protocol_version not in (2, 3) or self.layout is None
                 or self.active is not None or self.reset_pending):
             return None
         cubes = []
-        for cube_id, placement in sorted(self.realized.items()):
-            position = (VR_TO_GENESIS_AXES.T @
-                        (np.asarray(placement.position) - self.layout.workspace_center)
-                        / self.layout.scale)
-            w, x, y, z = placement.quaternion
-            rotation = np.array([
-                [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
-                [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
-                [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
-            ])
-            transform = np.eye(4)
-            transform[:3, :3] = (VR_TO_GENESIS_AXES.T @ rotation @
-                                 VR_TO_GENESIS_AXES) * self.layout.source_cube_size
-            transform[:3, 3] = position
-            cubes.append({"id": cube_id, "color": placement.color_name,
-                          "position": position.tolist(),
-                          "object_to_table": transform.ravel().tolist()})
+        for _, piece in sorted(self.realized.items()):
+            for placement in members_at_pose(piece, piece.position, piece.quaternion):
+                position = (VR_TO_GENESIS_AXES.T @
+                            (np.asarray(placement.position) - self.layout.workspace_center)
+                            / self.layout.scale)
+                w, x, y, z = placement.quaternion
+                rotation = np.array([
+                    [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
+                    [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
+                    [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
+                ])
+                transform = np.eye(4)
+                transform[:3, :3] = (VR_TO_GENESIS_AXES.T @ rotation @
+                                     VR_TO_GENESIS_AXES) * self.layout.source_cube_size
+                transform[:3, 3] = position
+                cubes.append({"id": placement.cube_id, "color": placement.color_name,
+                              "position": position.tolist(),
+                              "object_to_table": transform.ravel().tolist()})
+                if self.protocol_version == 3:
+                    cubes[-1].update(piece_id=placement.piece_id,
+                                     piece_index=placement.piece_index, piece_size=placement.piece_size)
         return {"session_id": self.session_id, "revision": self.revision,
                 "reset_generation": self._acknowledged_generation, "cubes": cubes}
 
@@ -477,7 +506,7 @@ class LiveStreamClient:
                         "stream": "CubeStack/RobotState", "content_type": "application/json",
                         "sequence": self._robot_sequence, "payload_bytes": len(body),
                         "timestamp": now,
-                        "metadata": json.dumps({"protocol_version": 2,
+                        "metadata": json.dumps({"protocol_version": self.queue.protocol_version,
                                                 "session_id": self.queue.session_id}),
                     }
                     encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
