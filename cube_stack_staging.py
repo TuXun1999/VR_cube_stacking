@@ -86,6 +86,19 @@ class StagingArea:
         slot = self.slots[key]
         return self.stacks[slot.side, slot.lane, slot.column][-1] == key
 
+    def relocate(self, key, feasible=None):
+        """Move a top reservation to another cell, restoring it on rejection."""
+        previous = self.slots[key]
+        self.release(key)
+        try:
+            return self.reserve(key, previous.color, previous.side,
+                                exclude_column=previous.column, exclude_lane=previous.lane,
+                                length=previous.length, feasible=feasible)
+        except Exception:
+            self.stacks[previous.side, previous.lane, previous.column].append(key)
+            self.slots[key] = previous
+            raise
+
     def top_above(self, key):
         slot = self.slots[key]
         stack = self.stacks[slot.side, slot.lane, slot.column]

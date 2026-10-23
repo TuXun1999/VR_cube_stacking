@@ -6,11 +6,12 @@ import time
 import numpy as np
 
 from cube_stack_layout import (
-    CubePlacement, TableLayout, as_piece, load_table_layout, parse_table_layout,
+    CubePlacement, PiecePlacement, TableLayout, as_piece, load_table_layout, parse_table_layout,
+    quaternion_to_rotation,
     placements_share_pose, rotation_matrix_to_quaternion,
 )
 from cube_stack_staging import StagingArea
-from cube_stack_piece_geometry import footprints_overlap
+from cube_stack_piece_geometry import footprints_overlap, members_at_pose
 
 gs = None  # Genesis is loaded only when a simulation is actually constructed.
 
@@ -84,6 +85,8 @@ class PoolCube:
     parked_position: tuple
     cube_id: str | None = None
     staging_slot: object = None
+    length: int = 1
+    piece: PiecePlacement | None = None
 
 
 @dataclass(frozen=True)
@@ -126,9 +129,11 @@ class ColorCubeDemo:
         self.carried_block = None
         self.carried_tool = None
         self.carried_quaternion = None
+        self.carried_tool_to_piece = None
         self.live_client = None
         self.live_queue = None
-        self.staging = StagingArea(self.layout, TARGET_CUBE_SIZE)
+        self.staging = StagingArea(self.layout, TARGET_CUBE_SIZE,
+                                   max_piece_length=3 if self.layout.map_version == 3 else 1)
 
         global gs
         if gs is None:
@@ -178,29 +183,33 @@ class ColorCubeDemo:
         # workspace until its turn at the color-specific feeder.
         material = gs.materials.Rigid(rho=200.0, friction=2.0)
         blocks = {}
-        placements = self.layout.placements
+        placements = self.layout.pieces
+        self._pool_specs = {}
         if self.options.live:
+            lengths = (1, 2, 3) if self.layout.map_version == 3 else (1,)
             placements = tuple(
-                CubePlacement(f"{color}_{serial}", color, (0, 0, 0), (0, 0, 0), (1, 0, 0, 0))
-                for color in COLOR_RGB
-                for serial in range(1, self.options.pool_per_color + 1)
-            )
+                PiecePlacement(f"{color}_L{length}_{serial}", color,
+                    tuple(CubePlacement(f"stock_{i}", color, (0, 0, 0), (0, 0, 0),
+                                        (1, 0, 0, 0)) for i in range(length)),
+                    (0, 0, 0), (0, 0, 0), (1, 0, 0, 0))
+                for color in COLOR_RGB for length in lengths
+                for serial in range(1, self.options.pool_per_color // length + 1))
         for index, placement in enumerate(placements):
-            parked_position = (
-                PARKED_BLOCK_ORIGIN[0] + index * 0.08,
-                PARKED_BLOCK_ORIGIN[1],
-                PARKED_BLOCK_ORIGIN[2],
-            )
+            parked_position = (PARKED_BLOCK_ORIGIN[0] + index * .28,
+                               PARKED_BLOCK_ORIGIN[1], PARKED_BLOCK_ORIGIN[2])
+            self._pool_specs[placement.cube_id] = (placement.color_name, placement.length)
+            if placement.length == 1:
+                morph = gs.morphs.Box(size=CUBE_SIZE, pos=parked_position,
+                                      fixed=not self.options.physical,
+                                      collision=self.options.physical)
+            else:
+                morph = gs.morphs.URDF(
+                    file=str(SCRIPT_DIR / "assets" / f"glued_piece_{placement.length}.urdf"),
+                    pos=parked_position, fixed=not self.options.physical,
+                    collision=self.options.physical, requires_jac_and_IK=False)
             blocks[placement.cube_id] = self.scene.add_entity(
-                gs.morphs.Box(
-                    size=CUBE_SIZE,
-                    pos=parked_position,
-                    fixed=not self.options.physical,
-                    collision=self.options.physical,
-                ),
-                material=material,
-                surface=gs.surfaces.Rough(color=COLOR_RGB[placement.color_name]),
-            )
+                morph, material=material,
+                surface=gs.surfaces.Rough(color=COLOR_RGB[placement.color_name]))
         return blocks
 
     def _add_staging_surfaces(self):
@@ -378,12 +387,12 @@ class ColorCubeDemo:
         self.scene.step()
         self.step_count += 1
         if self.carried_block is not None:
-            cube_position = to_numpy(self.carried_tool.get_pos()) - GRASP_OFFSET
-            self.carried_block.set_pos(cube_position, zero_velocity=True)
-            self.carried_block.set_quat(
-                self.carried_quaternion,
-                zero_velocity=True,
-            )
+            tool_rotation = quaternion_to_rotation(to_numpy(self.carried_tool.get_quat()))
+            offset, relative_rotation = self.carried_tool_to_piece
+            self.carried_block.set_pos(to_numpy(self.carried_tool.get_pos()) + tool_rotation @ offset,
+                                       zero_velocity=True)
+            self.carried_block.set_quat(rotation_matrix_to_quaternion(tool_rotation @ relative_rotation),
+                                        zero_velocity=True)
         if (
             self.recording_camera is not None
             and self.step_count % self.render_stride == 0
@@ -417,11 +426,10 @@ class ColorCubeDemo:
             robot.control_dofs_position(target, dofs_idx_local=dofs)
             self._step()
 
-    def _solve_tool(self, robot, tool, position, init_qpos=None):
+    def _solve_tool(self, robot, tool, position, init_qpos=None, tool_quaternion=None):
         """Solve arm-only IK without issuing robot commands."""
-        tool_quat = (
-            LEFT_TOOL_QUAT if robot is self.left_arm else RIGHT_TOOL_QUAT
-        )
+        tool_quat = (tool_quaternion if tool_quaternion is not None else
+                     LEFT_TOOL_QUAT if robot is self.left_arm else RIGHT_TOOL_QUAT)
         qpos, error = robot.inverse_kinematics(
             link=tool,
             pos=np.asarray(position),
@@ -464,9 +472,16 @@ class ColorCubeDemo:
         midpoint = (rise + over) / 2
         midpoint[2] = height
         clearance = STACK_RELEASE_CLEARANCE if place[2] > TARGET_CUBE_SIZE else RELEASE_CLEARANCE
+        if as_piece(placement).length > 1:
+            height += .5 * np.linalg.norm([TARGET_CUBE_SIZE, TARGET_CUBE_SIZE * as_piece(placement).length,
+                                          TARGET_CUBE_SIZE]) - TARGET_CUBE_SIZE / 2
+            at_pick = np.array((pick[0], pick[1], height))
+            over[2] = midpoint[2] = height
+            return (pick + HOVER_OFFSET, pick + GRASP_OFFSET, rise,
+                    at_pick, at_pick, midpoint, over,
+                    place + GRASP_OFFSET + clearance, place + HOVER_OFFSET)
         return (pick + HOVER_OFFSET, pick + GRASP_OFFSET, rise,
-                midpoint, over, place + GRASP_OFFSET + clearance,
-                place + HOVER_OFFSET)
+                midpoint, over, place + GRASP_OFFSET + clearance, place + HOVER_OFFSET)
 
     def _pick_and_place(self, robot, tool, block, pick_position, placement, joint_plan=None):
         pick_position = np.asarray(pick_position)
@@ -492,17 +507,21 @@ class ColorCubeDemo:
         if not self.options.physical:
             self.carried_block = block
             self.carried_tool = tool
-            self.carried_quaternion = placement.quaternion
+            tool_rotation = quaternion_to_rotation(to_numpy(tool.get_quat()))
+            self.carried_tool_to_piece = (
+                tool_rotation.T @ (to_numpy(block.get_pos()) - to_numpy(tool.get_pos())),
+                tool_rotation.T @ quaternion_to_rotation(to_numpy(block.get_quat())))
 
-        for index in range(2, 5):
+        for index in range(2, len(joint_plan) - 2):
             go(index, 140)
-        go(5, 100)
+        go(len(joint_plan) - 2, 100)
         if not self.options.physical:
             block.set_pos(place_position, zero_velocity=True)
             block.set_quat(placement.quaternion, zero_velocity=True)
             self.carried_block = None
             self.carried_tool = None
             self.carried_quaternion = None
+            self.carried_tool_to_piece = None
         self._move_joints(
             robot,
             [GRIPPER_OPEN],
@@ -510,7 +529,7 @@ class ColorCubeDemo:
             steps=60,
             settle=50,
         )
-        go(6, 100)
+        go(len(joint_plan) - 1, 100)
 
     def _park(self, robot, home_qpos):
         self._move_joints(robot, home_qpos, ARM_DOFS, steps=180, settle=30)
@@ -545,9 +564,12 @@ class ColorCubeDemo:
         return self.left_arm, self.left_tool, LEFT_ARM_HOME_QPOS
 
     def _setup_live_pool(self):
-        self.staging = StagingArea(self.layout, TARGET_CUBE_SIZE)
+        self.staging = StagingArea(self.layout, TARGET_CUBE_SIZE,
+                                   max_piece_length=3 if self.layout.map_version == 3 else 1)
         self.pool_cubes = {
-            key: PoolCube(key, key.rsplit("_", 1)[0], block, tuple(to_numpy(block.get_pos())))
+            key: PoolCube(key, getattr(self, "_pool_specs", {}).get(key, (key.split("_")[0], 1))[0],
+                          block, tuple(to_numpy(block.get_pos())),
+                          length=getattr(self, "_pool_specs", {}).get(key, (None, 1))[1])
             for key, block in self.blocks.items()
         }
         self.blocks = {}
@@ -558,7 +580,22 @@ class ColorCubeDemo:
     def _same_pose(first, second):
         return placements_share_pose(first, second)
 
+    def piece_members(self, piece_id):
+        piece = self._body_piece(piece_id)
+        return members_at_pose(piece, piece.position, piece.quaternion)
+
+    @staticmethod
+    def _validate_piece(placement):
+        piece = as_piece(placement)
+        if piece.length > 1 and not np.allclose(quaternion_to_rotation(piece.quaternion)[:, 2],
+                                               (0, 0, 1), atol=1e-5):
+            raise ValueError("The robot controller supports horizontal glued pieces only")
+        return piece
+
     def _remember(self, placement):
+        placement = replace(as_piece(placement),
+            position=tuple(float(v) for v in to_numpy(self.blocks[placement.cube_id].get_pos())),
+            quaternion=tuple(float(v) for v in to_numpy(self.blocks[placement.cube_id].get_quat())))
         self.current_placements[placement.cube_id] = placement
         self.placed_placements = list(self.current_placements.values())
         if self.live_queue is not None and hasattr(self.live_queue, "realized"):
@@ -566,8 +603,6 @@ class ColorCubeDemo:
 
     def _sample_physical_state(self, queue):
         """Replace command targets with measured bodies at a safe boundary."""
-        if not getattr(self.options, "physical", False):
-            return
         self.current_placements = {
             cube_id: replace(placement,
                              position=tuple(float(v) for v in to_numpy(self.blocks[cube_id].get_pos())),
@@ -580,7 +615,16 @@ class ColorCubeDemo:
     def _pool_cube(self, cube_id):
         return next((item for item in self.pool_cubes.values() if item.cube_id == cube_id), None)
 
-    def _transfer_plan(self, robot, tool, pick_position, placement):
+    def _grasp_quaternion(self, robot, quaternion):
+        base = LEFT_TOOL_QUAT if robot is self.left_arm else RIGHT_TOOL_QUAT
+        piece_rotation = quaternion_to_rotation(quaternion)
+        base_rotation = quaternion_to_rotation(base)
+        angle = np.arctan2(piece_rotation[1, 0], piece_rotation[0, 0]) - np.arctan2(base_rotation[1, 0], base_rotation[0, 0])
+        c, s = np.cos(angle), np.sin(angle)
+        yaw = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        return rotation_matrix_to_quaternion(yaw @ base_rotation)
+
+    def _transfer_plan(self, robot, tool, pick_position, placement, pickup_quaternion=None):
         actual = to_numpy(robot.get_dofs_position()).copy()
         home = actual.copy()
         home[:6] = LEFT_ARM_HOME_QPOS if robot is self.left_arm else RIGHT_ARM_HOME_QPOS
@@ -588,8 +632,13 @@ class ColorCubeDemo:
             seed = initial
             plan = []
             try:
-                for position in self._transfer_waypoints(pick_position, placement):
-                    seed = self._solve_tool(robot, tool, position, seed)
+                for index, position in enumerate(self._transfer_waypoints(pick_position, placement)):
+                    if as_piece(placement).length > 1:
+                        quaternion = (pickup_quaternion if pickup_quaternion is not None else placement.quaternion) if index < 4 else placement.quaternion
+                        seed = self._solve_tool(robot, tool, position, seed,
+                                                self._grasp_quaternion(robot, quaternion))
+                    else:
+                        seed = self._solve_tool(robot, tool, position, seed)
                     plan.append(seed.copy())
                 return tuple(plan)
             except RuntimeError:
@@ -603,7 +652,7 @@ class ColorCubeDemo:
         """Find free table-surface spots near its center, including tool clearance."""
         center = np.asarray(self.layout.workspace_center, dtype=float)
         pitch = TARGET_CUBE_SIZE + .04
-        half_diagonal = TARGET_CUBE_SIZE / np.sqrt(2)
+        half_diagonal = .5 * np.linalg.norm([TARGET_CUBE_SIZE, as_piece(placement).length * TARGET_CUBE_SIZE])
         # Stay in the central half of each table dimension, with the entire cube
         # on the table even for yawed placements or unusually small workspaces.
         x_limit = min(self.layout.workspace_depth / 4,
@@ -616,40 +665,47 @@ class ColorCubeDemo:
         others.update({id(item.block): item.block for item in getattr(self, "pool_cubes", {}).values()
                        if item.block is not block})
         # A circumscribed footprint plus 4 cm leaves room for the open gripper.
-        separation = 2 * half_diagonal + .04
+        radii = {id(other): .5 * np.linalg.norm([TARGET_CUBE_SIZE,
+                    as_piece(self.current_placements[key]).length * TARGET_CUBE_SIZE])
+                 for key, other in self.blocks.items() if key in self.current_placements}
+        radii.update({id(item.block): .5 * np.linalg.norm([TARGET_CUBE_SIZE, item.length * TARGET_CUBE_SIZE])
+                      for item in getattr(self, "pool_cubes", {}).values()})
         for x, y in offsets:
             dx, dy = x * pitch, y * pitch
             if abs(dx) > x_limit or abs(dy) > y_limit:
                 continue
             position = center + (dx, dy, TARGET_CUBE_SIZE / 2)
-            if any(np.linalg.norm(to_numpy(other.get_pos())[:2] - position[:2]) < separation
+            if any(np.linalg.norm(to_numpy(other.get_pos())[:2] - position[:2]) <
+                   half_diagonal + radii.get(id(other), TARGET_CUBE_SIZE / np.sqrt(2)) + .04
                    for other in others.values()):
                 continue
             yield replace(placement, position=tuple(float(value) for value in position))
 
     def _transfer_block(self, block, placement):
         """Transfer directly, or set down near table center for the other arm."""
+        placement = self._validate_piece(placement)
         source = to_numpy(block.get_pos())
+        pickup_quaternion = tuple(to_numpy(block.get_quat()))
         arms = [(self.left_arm, self.left_tool, LEFT_ARM_HOME_QPOS),
                 (self.right_arm, self.right_tool, RIGHT_ARM_HOME_QPOS)]
         if source[1] >= 0:
             arms.reverse()
         try:
             for robot, tool, home in arms:
-                plan = self._transfer_plan(robot, tool, source, placement)
+                plan = self._transfer_plan(robot, tool, source, placement, pickup_quaternion)
                 if plan is not None:
                     self._pick_and_place(robot, tool, block, source, placement, plan)
                     self._park(robot, home)
                     return
             for relay in self._handoff_candidates(block, placement):
                 for first in arms:
-                    first_plan = self._transfer_plan(first[0], first[1], source, relay)
+                    first_plan = self._transfer_plan(first[0], first[1], source, relay, pickup_quaternion)
                     if first_plan is None:
                         continue
                     for second in reversed(arms):
                         if second[0] is first[0]:
                             continue
-                        second_plan = self._transfer_plan(second[0], second[1], relay.position, placement)
+                        second_plan = self._transfer_plan(second[0], second[1], relay.position, placement, relay.quaternion)
                         if second_plan is None:
                             continue
                         self._pick_and_place(first[0], first[1], block, source, relay, first_plan)
@@ -660,20 +716,32 @@ class ColorCubeDemo:
             raise RuntimeError(f"No reachable robot transfer for {placement.cube_id}: "
                                f"{tuple(source)} -> {placement.position}")
         finally:
-            self.carried_block = self.carried_tool = self.carried_quaternion = None
+            self.carried_block = self.carried_tool = self.carried_quaternion = self.carried_tool_to_piece = None
 
     def _staging_target(self, item, slot):
-        return CubePlacement(item.cube_id or item.key, item.color, (0, 0, 0),
-                             slot.position, tuple(float(v) for v in to_numpy(item.block.get_quat())))
+        template = item.piece or as_piece(CubePlacement(item.cube_id or item.key, item.color,
+                                                       (0, 0, 0), (0, 0, 0), (1, 0, 0, 0)))
+        quaternion = slot.quaternion if self.staging.max_piece_length > 1 else tuple(to_numpy(item.block.get_quat()))
+        return replace(template, position=slot.position, quaternion=quaternion)
+
+    def _staging_feasible(self, item, slot, destination=None):
+        target = destination or self._staging_target(item, slot)
+        source = slot.position if destination is not None else tuple(to_numpy(item.block.get_pos()))
+        quaternion = slot.quaternion if destination is not None else tuple(to_numpy(item.block.get_quat()))
+        return any(self._transfer_plan(robot, tool, source, target, quaternion) is not None
+                   for robot, tool in ((self.left_arm, self.left_tool), (self.right_arm, self.right_tool)))
+
+    def _reserve_staging(self, item, side, destination=None, **kwargs):
+        return self.staging.reserve(item.key, item.color, side, length=item.length,
+            feasible=lambda slot: self._staging_feasible(item, slot, destination), **kwargs)
 
     def _ensure_staging_access(self, item):
         """Unstack supply cubes with the robot before picking a buried object."""
         while not self.staging.is_top(item.key):
             blocker = self.pool_cubes[self.staging.top_above(item.key)]
             previous = blocker.staging_slot
-            self.staging.release(blocker.key)
-            slot = self.staging.reserve(blocker.key, blocker.color, previous.side,
-                                        exclude_column=previous.column, exclude_lane=previous.lane)
+            slot = self.staging.relocate(blocker.key,
+                feasible=lambda candidate: self._staging_feasible(blocker, candidate))
             blocker.staging_slot = slot
             target = self._staging_target(blocker, slot)
             self._transfer_block(blocker.block, target)
@@ -685,7 +753,7 @@ class ColorCubeDemo:
         if item is None or item.staging_slot is not None:
             return
         side = "right" if to_numpy(item.block.get_pos())[1] >= 0 else "left"
-        slot = self.staging.reserve(item.key, item.color, side)
+        slot = self._reserve_staging(item, side)
         item.staging_slot = slot
         target = self._staging_target(item, slot)
         self._transfer_block(item.block, target)
@@ -734,8 +802,9 @@ class ColorCubeDemo:
         template = self.current_placements.get(cube_id)
         if template is None:
             item = self._pool_cube(cube_id)
-            template = CubePlacement(cube_id, item.color if item else "blue", (0, 0, 0),
-                                     (0, 0, 0), (1, 0, 0, 0))
+            template = (item.piece if item and item.piece is not None else
+                        CubePlacement(cube_id, item.color if item else "blue", (0, 0, 0),
+                                      (0, 0, 0), (1, 0, 0, 0)))
         block = self.blocks[cube_id]
         return replace(as_piece(template), position=tuple(to_numpy(block.get_pos())),
                        quaternion=tuple(to_numpy(block.get_quat())))
@@ -836,12 +905,15 @@ class ColorCubeDemo:
 
     def move_live_cube(self, placement):
         """Pick the requested cube at its current pose and place it directly."""
+        placement = self._validate_piece(placement)
         current = self.current_placements.get(placement.cube_id)
+        if current is not None and (as_piece(current).length != placement.length or current.color_name != placement.color_name):
+            raise ValueError("A glued piece cannot change length or color")
         if current is None or self._same_pose(current, placement):
             return
         desired = dict(self.current_placements)
         if self.live_queue is not None:
-            desired = {p.cube_id: p for p in self.live_queue.layout.placements}
+            desired = {p.cube_id: p for p in self.live_queue.layout.pieces}
         desired[placement.cube_id] = placement
         deferred = set()
         if not self._try_direct_move(placement, desired, set(), deferred):
@@ -855,7 +927,7 @@ class ColorCubeDemo:
             return
         desired = dict(self.current_placements)
         if self.live_queue is not None:
-            desired = {p.cube_id: p for p in self.live_queue.layout.placements}
+            desired = {p.cube_id: p for p in self.live_queue.layout.pieces}
         desired.pop(placement.cube_id, None)
         affected = self._stack_blockers({placement.cube_id})
         for cube_id in sorted(affected, key=lambda key: self.blocks[key].get_pos()[2], reverse=True):
@@ -866,7 +938,7 @@ class ColorCubeDemo:
 
     def reset_live_scene(self):
         """Reset entities and arm controllers in the already built Genesis scene."""
-        self.carried_block = self.carried_tool = self.carried_quaternion = None
+        self.carried_block = self.carried_tool = self.carried_quaternion = self.carried_tool_to_piece = None
         for item in self.pool_cubes.values():
             item.block.set_pos(item.parked_position, zero_velocity=True)
             item.block.set_quat((1, 0, 0, 0), zero_velocity=True)
@@ -881,21 +953,22 @@ class ColorCubeDemo:
     def _spawn_block(self, block, placement, robot):
         """Create a new supply cube in staging before its first robot pickup."""
         side = "right" if robot is self.right_arm else "left"
-        slot = self.staging.reserve(placement.cube_id, placement.color_name, side)
+        slot = self.staging.reserve(placement.cube_id, placement.color_name, side, length=as_piece(placement).length)
         spawn_position = slot.position
         block.set_pos(spawn_position, zero_velocity=True)
-        block.set_quat(placement.quaternion, zero_velocity=True)
+        block.set_quat(slot.quaternion if self.staging.max_piece_length > 1 else placement.quaternion, zero_velocity=True)
         for _ in range(self._scaled_steps(SPAWN_SETTLE_STEPS)):
             self._step()
         return spawn_position
 
     def _place_colored_cubes(self):
         """Spawn and place every transformed JSON cube from bottom to top."""
-        for placement in self.layout.placements:
+        for placement in self.layout.pieces:
             self.place_live_cube(placement)
 
     def place_live_cube(self, placement):
         """Execute one arbitrary imported pose; the caller owns queue ordering."""
+        placement = self._validate_piece(placement)
         deferred = set()
         desired = {}
         try:
@@ -905,7 +978,7 @@ class ColorCubeDemo:
                     return
                 desired = dict(self.current_placements)
                 if self.live_queue is not None:
-                    desired = {p.cube_id: p for p in self.live_queue.layout.placements}
+                    desired = {p.cube_id: p for p in self.live_queue.layout.pieces}
                 desired[placement.cube_id] = placement
                 for cube_id in sorted(self._destination_occupants(placement),
                                       key=lambda key: self.blocks[key].get_pos()[2], reverse=True):
@@ -913,18 +986,23 @@ class ColorCubeDemo:
                         continue
                     self._resolve_obstruction(cube_id, desired, {placement.cube_id}, deferred)
                 supplies = [item for item in self.pool_cubes.values()
-                            if item.color == placement.color_name and item.cube_id is None]
+                            if item.color == placement.color_name and item.length == placement.length and item.cube_id is None]
                 if not supplies:
-                    raise RuntimeError(f"No reusable {placement.color_name} supply cube")
+                    raise RuntimeError(f"No reusable {placement.color_name} supply piece of length {placement.length}")
                 side = "right" if placement.position[1] >= 0 else "left"
                 supplies.sort(key=lambda item: (item.staging_slot is None,
                                                item.staging_slot is not None and item.staging_slot.side != side,
                                                item.staging_slot is not None and not self.staging.is_top(item.key)))
                 item = supplies[0]
+                allocated = sum(candidate.length for candidate in self.pool_cubes.values()
+                                if candidate.color == placement.color_name and candidate.cube_id is not None)
+                if allocated + placement.length > self.options.pool_per_color:
+                    raise RuntimeError(f"{placement.color_name} constituent-cube pool exhausted")
+                item.piece = placement
                 if item.staging_slot is None:
-                    item.staging_slot = self.staging.reserve(item.key, item.color, side)
+                    item.staging_slot = self._reserve_staging(item, side, destination=placement)
                     item.block.set_pos(item.staging_slot.position, zero_velocity=True)
-                    item.block.set_quat(placement.quaternion, zero_velocity=True)
+                    item.block.set_quat(item.staging_slot.quaternion if self.staging.max_piece_length > 1 else placement.quaternion, zero_velocity=True)
                     for _ in range(self._scaled_steps(SPAWN_SETTLE_STEPS)):
                         self._step()
                 self._ensure_staging_access(item)
@@ -949,6 +1027,7 @@ class ColorCubeDemo:
             self.carried_block = None
             self.carried_tool = None
             self.carried_quaternion = None
+            self.carried_tool_to_piece = None
 
     def run_live(self, queue, client, max_cubes=0):
         """Only this outer loop starts commands; _step only receives/enqueues."""
@@ -982,11 +1061,11 @@ class ColorCubeDemo:
                     self._sample_physical_state(queue)
                     client.publish_robot_state()
                 except ResetRequested:
-                    self.carried_block = self.carried_tool = self.carried_quaternion = None
+                    self.carried_block = self.carried_tool = self.carried_quaternion = self.carried_tool_to_piece = None
                     queue.cancel_active_for_reset()
         except BaseException as error:
             queue.fail_active(str(error) or type(error).__name__)
-            self.carried_block = self.carried_tool = self.carried_quaternion = None
+            self.carried_block = self.carried_tool = self.carried_quaternion = self.carried_tool_to_piece = None
             raise
         finally:
             # Saving a failed run must not advance the scene or issue commands.
@@ -995,7 +1074,7 @@ class ColorCubeDemo:
 
     def _print_final_positions(self):
         print("VR cubes placed. Target -> final position (meters):")
-        for placement in self.layout.placements:
+        for placement in self.layout.pieces:
             block = self.blocks[placement.cube_id]
             actual = to_numpy(block.get_pos())
             error = np.linalg.norm(actual - np.asarray(placement.position))

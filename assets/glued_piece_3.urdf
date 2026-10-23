@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!-- Original Author: OpenAI Codex, 2026. One rigid link; local +Y is the glued bar axis. -->
+<robot name="glued_piece_3"><link name="piece">
+<inertial><mass value="0.30720000000000003"/><inertia ixx="0.0016384000000000001" ixy="0" ixz="0" iyy="0.00032768000000000006" iyz="0" izz="0.0016384000000000001"/></inertial>
+<visual><origin xyz="0 -0.080000 0"/><geometry><box size="0.08 0.0796 0.08"/></geometry></visual>
+<visual><origin xyz="0 0.000000 0"/><geometry><box size="0.08 0.0796 0.08"/></geometry></visual>
+<visual><origin xyz="0 0.080000 0"/><geometry><box size="0.08 0.0796 0.08"/></geometry></visual>
+<collision><geometry><box size="0.08 0.24 0.08"/></geometry></collision>
+</link></robot>

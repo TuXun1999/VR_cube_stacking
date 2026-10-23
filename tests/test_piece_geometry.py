@@ -50,6 +50,14 @@ class PieceGeometryTests(unittest.TestCase):
         self.assertEqual(slot.side, "right")
         self.assertEqual(slot.length, 3)
 
+    def test_unreachable_relocation_retains_the_original_reservation(self):
+        area = StagingArea(layout(), max_piece_length=3)
+        original = area.reserve("bar", "red", "left", length=3)
+        with self.assertRaisesRegex(RuntimeError, "reachable"):
+            area.relocate("bar", feasible=lambda _: False)
+        self.assertEqual(area.slots["bar"], original)
+        self.assertTrue(area.is_top("bar"))
+
     def test_invalid_lengths_fail_before_mutating_storage(self):
         area = StagingArea(layout(), max_piece_length=3)
         for length in (0, 4, 1.5, True, float("nan")):

@@ -52,9 +52,10 @@ class LiveRunnerTests(unittest.TestCase):
         demo.live_client = None
         demo.left_arm = object()
         demo.right_arm = object()
-        demo.left_tool = object()
-        demo.right_tool = object()
+        demo.left_tool = Entity((0, 0, .14))
+        demo.right_tool = Entity((0, 0, .14))
         demo._step = lambda: None
+        demo._staging_feasible = lambda *args: True
         demo._initialize_poses = lambda: None
         demo._setup_live_pool()
         self.transfers = []
@@ -298,8 +299,8 @@ class LiveRunnerTests(unittest.TestCase):
         demo = self.demo
         demo.left_arm = SimpleNamespace(get_dofs_position=lambda: np.zeros(13))
         demo.right_arm = SimpleNamespace(get_dofs_position=lambda: np.zeros(13))
-        demo.left_tool = object()
-        demo.right_tool = object()
+        demo.left_tool = Entity((0, 0, .14))
+        demo.right_tool = Entity((0, 0, .14))
         solutions = []
 
         def solve(robot, tool, position, init_qpos=None):
@@ -324,7 +325,7 @@ class LiveRunnerTests(unittest.TestCase):
         demo = self.demo
         demo.left_arm = SimpleNamespace(get_dofs_position=lambda: np.zeros(13))
         demo.right_arm = SimpleNamespace(get_dofs_position=lambda: np.zeros(13))
-        demo.left_tool, demo.right_tool = object(), object()
+        demo.left_tool, demo.right_tool = Entity((0, 0, .14)), Entity((0, 0, .14))
 
         def solve(robot, tool, position, init_qpos=None):
             # Each arm can reach the center and its own lateral half, but cannot

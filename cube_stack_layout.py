@@ -107,6 +107,7 @@ class TableLayout:
     workspace_depth: float
     workspace_center: tuple[float, float, float]
     placements: tuple[CubePlacement, ...]
+    map_version: int = 2
 
     @property
     def pieces(self):
@@ -324,4 +325,5 @@ def _parse_table_layout(data, target_cube_size, path, require_ids):
         workspace_depth=workspace_depth,
         workspace_center=tuple(float(value) for value in workspace_center),
         placements=tuple(placements),
+        map_version=data["version"],
     )

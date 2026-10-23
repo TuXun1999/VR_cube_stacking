@@ -266,6 +266,7 @@ class RobotStateSocketTests(unittest.TestCase):
         self.connect(snapshot(cube("a", x=.1)))
         demo = ColorCubeDemo.__new__(ColorCubeDemo)
         demo.options = type("Options", (), {"pool_per_color": 30})()
+        demo._sample_physical_state = lambda queue: None
         demo._start_recording = lambda: None
         demo._stop_recording = lambda settle=False: None
 
@@ -287,6 +288,7 @@ class RobotStateSocketTests(unittest.TestCase):
         self.connect(snapshot())
         demo = ColorCubeDemo.__new__(ColorCubeDemo)
         demo.options = type("Options", (), {"pool_per_color": 30})()
+        demo._sample_physical_state = lambda queue: None
         demo._start_recording = lambda: None
         demo._stop_recording = lambda settle=False: None
 
