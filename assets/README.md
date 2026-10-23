@@ -8,3 +8,10 @@ with its built-in image-generation tool for the Cube Stack application.
 right to Genesis +Y and image down to Genesis +X, matching the cube importer.
 The simulation fits it to the workspace table and reserves the left 12% for
 the palette margin used by OpenUp. The surface has no collisions.
+
+
+`glued_piece_2.urdf` and `glued_piece_3.urdf` were authored for this application
+by OpenAI Codex in 2026. Each contains one rigid link with two or three unit-cube
+visuals and one complete rectangular collision shape. The long axis is local +Y
+(Genesis +Y corresponds to OpenUp construction +X). A 0.4 mm visual seam makes
+the members visible while the collision shape and rigid attachment stay solid.

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from cube_stack_layout import CubePlacement, parse_table_layout
-from cube_stack_piece_geometry import members_at_pose
+from cube_stack_layout import CubePlacement, parse_table_layout, quaternion_to_rotation
+from cube_stack_staging import StagingSlot
 from vr_json_cube_stacking import ColorCubeDemo, DemoOptions, to_numpy
 
 
@@ -36,6 +36,7 @@ def verify(record=None):
         record_path=Path(record) if record else None))
     legs = []
     samples = 0
+    grasp_relative_pose = None
     pick = demo._pick_and_place
     step = demo._step
 
@@ -44,8 +45,18 @@ def verify(record=None):
         return pick(robot, tool, block, source, target, plan)
 
     def sampled_step():
-        nonlocal samples
+        nonlocal samples, grasp_relative_pose
         step()
+        if demo.carried_block is None:
+            grasp_relative_pose = None
+        else:
+            tool_rotation = quaternion_to_rotation(to_numpy(demo.carried_tool.get_quat()))
+            offset = tool_rotation.T @ (to_numpy(demo.carried_block.get_pos()) - to_numpy(demo.carried_tool.get_pos()))
+            rotation = tool_rotation.T @ quaternion_to_rotation(to_numpy(demo.carried_block.get_quat()))
+            if grasp_relative_pose is None:
+                grasp_relative_pose = (offset.copy(), rotation.copy())
+            np.testing.assert_allclose(offset, grasp_relative_pose[0], atol=2e-6)
+            np.testing.assert_allclose(rotation, grasp_relative_pose[1], atol=2e-5)
         for piece_id in demo.blocks:
             item = demo._pool_cube(piece_id)
             if item is None or item.piece is None:
@@ -122,19 +133,23 @@ def verify(record=None):
         # Inspect the whole default rack, including upper tiers, with actual IK.
         reachable = 0
         rejected = 0
-        item = demo._pool_cube("crossing")
         for side in ("left", "right"):
             for color in demo.staging.colors:
                 for column in range(demo.staging.columns):
-                    from cube_stack_staging import StagingSlot
-                    for level in (0, 2, 4):
-                        slot = StagingSlot(side, color, column, level,
-                            demo.staging.position(side, color, column, level), color,
-                            3, (2**-.5, 0, 0, 2**-.5))
-                        if demo._staging_feasible(item, slot):
-                            reachable += 1
-                        else:
-                            rejected += 1
+                    for level in (0, 2, 4, 7):
+                        for length in (1, 2, 3):
+                            slot = StagingSlot(side, color, column, level,
+                                demo.staging.position(side, color, column, level), color,
+                                length, (2**-.5, 0, 0, 2**-.5))
+                            target = replace(piece("probe", length, color, slot.position),
+                                             quaternion=slot.quaternion)
+                            if any(demo._transfer_plan(arm, tool, crossing.position, target,
+                                                      crossing.quaternion) is not None
+                                   for arm, tool in ((demo.left_arm, demo.left_tool),
+                                                     (demo.right_arm, demo.right_tool))):
+                                reachable += 1
+                            else:
+                                rejected += 1
         assert reachable > 0
         print(f"verified: actual rack IK: {reachable} reachable candidates, {rejected} rejected safely", flush=True)
 

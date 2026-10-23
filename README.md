@@ -23,7 +23,7 @@ construction and follows cube moves, deletions, and explicit session resets.
 ├── test_ur5e_robotiq_pose.py       # Genesis scene and robot controller
 ├── stacking_panel.py               # Interactive placement panel
 ├── vr_json_cube_stacking.py        # VR table-map importer and robot replay
-├── cube_stack_layout.py           # Shared Genesis-free V2 map parser
+├── cube_stack_layout.py           # Shared Genesis-free version-2/3 map parser
 ├── cube_stack_stream.py           # Live stream decoder and acceptance queue
 ├── cube_stack_staging.py          # Outside-table supply/return stack allocation
 ├── verify_live_edits.py           # Headless Genesis edit/reset verification
@@ -239,14 +239,24 @@ Each new cube appears on a staging surface
 beside the table's left or right edge before the robot picks it up. These
 surfaces are level with the construction table; all cells sit beyond its lateral
 footprint, near its rack-facing end. Each side shows three continuous rectangular
-strips in red, green, and blue, with matching lengths and aligned ends. Nine
-pickup cells on each side hold supply and returns on matching strips: red cubes
+strips in red, green, and blue, with matching lengths and aligned ends. Pickup
+cells hold complete supply and returned pieces on matching strips: red cubes
 use red, green use green, and blue use blue. New cubes spawn on their own strip,
 and deletion returns and temporary staging moves keep that color assignment.
-Each color has six cells across both sides; balanced storage holds its default
-30-cube return pool in five tiers. Returned cubes remain visible and supply
-later same-color placements. The robot uncovers buried objects before
+Version-3 racks use long cells aligned with table depth, with two columns per
+side on the default table. Whole-piece footprints and actual IK determine which
+slots are available. Full or unreachable storage fails explicitly. Returned
+pieces supply later placements of the same color and length.
+`--pool-per-color` counts constituent cubes: a double uses two units and a triple
+three. Bodies for each color and length are created before the scene is built. The robot uncovers buried objects before
 picking them.
+
+Click the active OpenUp palette color repeatedly to cycle **1 -> 2 -> 3 -> 1**.
+Changing color resets the next size to one. Doubles and triples are permanently
+glued: one rigid body, one center grasp across the 8 cm short side, and one
+whole-piece robot command. Wrist yaw follows pickup/destination orientation;
+kinematic carrying preserves the measured tool-to-piece transform. Selecting
+any member selects the entire piece.
 
 Hold a shadow in OpenUp to select, drag and release gently to request a move,
 or swipe quickly and release to delete. The robot picks existing cubes from
@@ -322,11 +332,12 @@ message, pool exhaustion, or rejected map exits with status 1. Omitting both
 limits keeps receiving until Ctrl+C.
 
 The wire format is two uint32 little-endian length-prefixed blocks: a JSON
-header followed by the UTF-8 V2 `openup.cube_stack.map` payload. The header
+header followed by the UTF-8 version-3 `openup.cube_stack.map` payload. The header
 uses `stream: CubeStack/Map`, `content_type: application/json`, a matching
 `payload_bytes`, and a **string** containing JSON metadata with
-`protocol_version: 2` and a per-table-process `session_id`. Each cube carries a
-stable string `id`; the map carries a monotonic `revision` and explicit
+`protocol_version: 3` and a per-table-process `session_id`. Each cube carries a
+stable string `id`, `piece_id`, `piece_index`, and declared `piece_size` (1-3).
+Every snapshot must contain each complete rigid group. The map carries a monotonic `revision` and explicit
 `reset_generation`. The generation survives missed intermediate reset maps,
 including a reset immediately followed by a new placement. Each block is
 limited to 64 MiB. The original table-local positions and scaled row-major
@@ -338,7 +349,9 @@ starting another publisher process, exceeding simultaneous color capacity,
 malformed frames, or an unreachable robot transfer produces a visible `HALTED`
 state. A failed partial motion is not retried automatically: stop the receiver,
 reset OpenUp, restart the receiver, and wait for `ready`. Ordinary construction
-reset uses the button/F6 and needs no restart. Legacy protocol 1 publishers
+reset uses the button/F6 and needs no restart. Version-2 maps and protocol-1/2
+singleton streams remain supported; old receivers reject protocol 3 before motion.
+Legacy protocol 1 publishers
 remain supported for additions only; update both projects for edit/reset support.
 Kinematic replay preserves the requested poses, including floating designs the
 editor permits. `--physical` separately enables free rigid bodies to assess
@@ -375,3 +388,21 @@ from that project and the upstream Universal Robots and Robotiq description
 packages. This project does not assign a new license to those third-party
 assets.
 
+
+
+### Glued-piece verification
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe verify_glued_pieces.py
+# Optional rendered video:
+.\.venv\Scripts\python.exe verify_glued_pieces.py --record outputs/glued-pieces.mp4
+```
+
+On Windows with Python 3.11 and Genesis CPU, the glued verifier checks doubles
+and triples as one-link bodies with one grasp, measured tool-relative carrying,
+yawed floating targets, bar-end blockers, oriented staging, same-shape reuse,
+reset, unreachable-target rejection and a real two-arm triple handoff. The full
+C++ publisher/Genesis integration also checks add/move/delete/reset for both sizes.
+This verifies the default kinematic controller; physical grasp/stack stability
+and physical table/Quest interaction require their own hardware checks.
