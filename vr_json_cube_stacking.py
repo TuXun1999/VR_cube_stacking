@@ -6,10 +6,11 @@ import time
 import numpy as np
 
 from cube_stack_layout import (
-    CubePlacement, TableLayout, load_table_layout, parse_table_layout,
+    CubePlacement, TableLayout, as_piece, load_table_layout, parse_table_layout,
     placements_share_pose, rotation_matrix_to_quaternion,
 )
 from cube_stack_staging import StagingArea
+from cube_stack_piece_geometry import footprints_overlap
 
 gs = None  # Genesis is loaded only when a simulation is actually constructed.
 
@@ -206,7 +207,7 @@ class ColorCubeDemo:
         """Draw three continuous color strips on each side of the table."""
         for side in ("left", "right"):
             positions = [self.staging.position(side, lane, column)
-                         for lane in self.staging.lanes for column in range(3)]
+                         for lane in self.staging.lanes for column in range(self.staging.columns)]
             cell_depth, cell_width = self.staging.cell_footprint
             x_min = min(position[0] for position in positions) - cell_depth / 2
             x_max = max(position[0] for position in positions) + cell_depth / 2
@@ -729,26 +730,34 @@ class ColorCubeDemo:
                 return False
         return True
 
+    def _body_piece(self, cube_id):
+        template = self.current_placements.get(cube_id)
+        if template is None:
+            item = self._pool_cube(cube_id)
+            template = CubePlacement(cube_id, item.color if item else "blue", (0, 0, 0),
+                                     (0, 0, 0), (1, 0, 0, 0))
+        block = self.blocks[cube_id]
+        return replace(as_piece(template), position=tuple(to_numpy(block.get_pos())),
+                       quaternion=tuple(to_numpy(block.get_quat())))
+
     def _destination_occupants(self, target):
-        return {cube_id for cube_id, block in self.blocks.items()
+        return {cube_id for cube_id in self.blocks
                 if (cube_id != target.cube_id
-                    and abs(to_numpy(block.get_pos())[2] - target.position[2]) < TARGET_CUBE_SIZE - 1e-5
-                    and self._footprints_overlap(target.position, target.quaternion,
-                                                 to_numpy(block.get_pos()), to_numpy(block.get_quat())))}
+                    and abs(self._body_piece(cube_id).position[2] - target.position[2]) < TARGET_CUBE_SIZE - 1e-5
+                    and footprints_overlap(target, self._body_piece(cube_id)))}
 
     def _stack_blockers(self, cube_ids):
         affected = set(cube_ids)
         while True:
             additional = set()
             for cube_id in affected:
-                source = to_numpy(self.blocks[cube_id].get_pos())
-                for other_id, block in self.blocks.items():
+                source = self._body_piece(cube_id)
+                for other_id in self.blocks:
                     if other_id in affected:
                         continue
-                    other = to_numpy(block.get_pos())
-                    if (other[2] > source[2] + 1e-5
-                            and self._footprints_overlap(source, to_numpy(self.blocks[cube_id].get_quat()),
-                                                         other, to_numpy(block.get_quat()))):
+                    other = self._body_piece(other_id)
+                    if (other.position[2] > source.position[2] + 1e-5
+                            and footprints_overlap(source, other)):
                         additional.add(other_id)
             if not additional:
                 return affected
@@ -757,8 +766,7 @@ class ColorCubeDemo:
     def _ready_to_restore(self, target, desired):
         for support in desired.values():
             if (support.position[2] < target.position[2] - 1e-5
-                    and np.all(np.abs(np.asarray(support.position[:2]) - target.position[:2])
-                               < TARGET_CUBE_SIZE - 1e-5)):
+                    and footprints_overlap(support, target)):
                 actual = self.current_placements.get(support.cube_id)
                 if actual is None or not self._same_pose(actual, support):
                     return False
