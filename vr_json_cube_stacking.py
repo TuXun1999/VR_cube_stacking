@@ -18,6 +18,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 URDF_PATH = SCRIPT_DIR / "zeus_description" / "ur5e_robotiq_2f85.urdf"
 DEFAULT_MAP_PATH = SCRIPT_DIR / "example_table_data.json"
 DEFAULT_VIDEO_PATH = SCRIPT_DIR / "outputs" / "vr_json_cube_stacking.mp4"
+TABLE_MAP_PATH = SCRIPT_DIR / "assets" / "islands.png"
+TABLE_MAP_MESH_PATH = SCRIPT_DIR / "assets" / "table_map.obj"
+TABLE_PALETTE_WIDTH_FRACTION = 0.12
 SIM_DT = 0.01
 TARGET_CUBE_SIZE = 0.08
 
@@ -219,7 +222,7 @@ class ColorCubeDemo:
                 )
 
     def _add_workspace_table(self):
-        """Draw the uniformly scaled VR table footprint and its center axes."""
+        """Draw the VR table's island map, footprint, and center axes."""
         center_x, center_y, _ = self.layout.workspace_center
         half_depth = self.layout.workspace_depth / 2
         half_width = self.layout.workspace_width / 2
@@ -235,6 +238,24 @@ class ColorCubeDemo:
                 collision=False,
             ),
             surface=table_surface,
+        )
+
+        map_width = self.layout.workspace_width * (1 - TABLE_PALETTE_WIDTH_FRACTION)
+        map_center_y = center_y + self.layout.workspace_width * TABLE_PALETTE_WIDTH_FRACTION / 2
+        self.scene.add_entity(
+            gs.morphs.Mesh(
+                file=str(TABLE_MAP_MESH_PATH),
+                scale=(self.layout.workspace_depth, map_width, 1.0),
+                pos=(center_x, map_center_y, 0.0002),
+                fixed=True,
+                collision=False,
+                decimate=False,
+                convexify=False,
+            ),
+            surface=gs.surfaces.Rough(
+                diffuse_texture=gs.textures.ImageTexture(image_path=str(TABLE_MAP_PATH)),
+                double_sided=True,
+            ),
         )
 
         for x in (x_min, x_max):

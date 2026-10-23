@@ -232,7 +232,10 @@ python3 -u vr_json_cube_stacking.py --live --host 127.0.0.1 --port 9036 --pool-p
 
 The receiver waits for the first map, including an empty table, builds Genesis
 once, and prints `ready` after scene initialization. It prebuilds 30 reusable
-8 cm cube entities per color. Each new cube appears on a staging surface
+8 cm cube entities per color. The robot's workspace table displays the same
+bundled island map as OpenUp Cube Stack, with matching orientation and the
+left 12% palette margin. The map also appears during offline JSON replay.
+Each new cube appears on a staging surface
 beside the table's left or right edge before the robot picks it up. These
 surfaces are level with the construction table; all cells sit beyond its lateral
 footprint, near its rack-facing end. Each side shows three continuous rectangular
