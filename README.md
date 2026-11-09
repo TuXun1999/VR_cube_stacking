@@ -22,10 +22,15 @@ construction and follows cube moves, deletions, and explicit session resets.
 .
 ├── test_ur5e_robotiq_pose.py       # Genesis scene and robot controller
 ├── stacking_panel.py               # Interactive placement panel
-├── vr_json_cube_stacking.py        # VR table-map importer and robot replay
+├── robot_receiver.py               # Live receiver; picks the simulator with --sim
+├── vr_json_cube_stacking.py        # Genesis backend, VR table-map importer and robot replay
+├── toyblocks_backend/              # AllenAI ToyBlocks (Isaac Sim, Franka FR3) backend
+├── cube_stack_receiver.py          # Shared live loop, pump/reset checks, pose tolerance
+├── cube_stack_planner.py           # Shared live planning: blockers, staging, ordering
 ├── cube_stack_layout.py           # Shared Genesis-free version-2/3 map parser
 ├── cube_stack_stream.py           # Live stream decoder and acceptance queue
 ├── cube_stack_staging.py          # Outside-table supply/return stack allocation
+├── tools/fake_table_publisher.py   # Scripted stand-in for OpenUp, for any backend
 ├── verify_live_edits.py           # Headless Genesis edit/reset verification
 ├── example_table_data.json         # Example openup.cube_stack.map input
 ├── table_frame.png                 # VR table-frame convention
@@ -160,6 +165,97 @@ Headless execution and video recording are also supported:
 python3 vr_json_cube_stacking.py --headless --speed 3
 python3 vr_json_cube_stacking.py --record outputs/vr_json_cube_stacking.mp4
 ```
+
+## Choose a robot simulator
+
+OpenUp Cube Stack does not know which simulator answers on its simulation port,
+so the simulator is chosen when you start the receiver. `robot_receiver.py`
+accepts the same live flags as `vr_json_cube_stacking.py`, plus `--sim`:
+
+| `--sim` | Robot | Runs on | Notes |
+|---|---|---|---|
+| `genesis` (default) | Two UR5e + Robotiq 2F-85 | Windows/Linux, CPU | Kinematic carrying by default; `--physical`, `--record`, `--speed` |
+| `toyblocks` | One Franka FR3 + Robotiq 2F-85 | Linux + NVIDIA GPU | Isaac Sim physics; see [ToyBlocks backend](#toyblocks-backend) |
+
+```powershell
+.\.venv\Scripts\python.exe -u robot_receiver.py --sim genesis --live --host 127.0.0.1 --port 9036
+```
+
+`vr_json_cube_stacking.py --live` still starts the Genesis receiver directly.
+Both backends share one live loop (`cube_stack_receiver.py`) and one planner
+(`cube_stack_planner.py`), so they print the same `ready:`, `started:`,
+`completed:` and `live complete:` lines and report `CubeStack/RobotState` the
+same way. A backend module supplies `BACKEND_DESCRIPTION`,
+`DEFAULT_POOL_PER_COLOR`, `add_backend_arguments(parser)` and
+`build_backend(layout, args)`, and is registered in `robot_receiver.BACKENDS`.
+
+### Test any backend without OpenUp
+
+`tools/fake_table_publisher.py` plays OpenUp's part: it publishes a script of
+protocol-3 maps and waits for each to be confirmed by `RobotState`, using
+OpenUp's own 1e-5 matrix check. The default script
+(`tools/scripts/basic_edits.json`) adds, stacks, places a yawed triple bar,
+moves, deletes and resets, all within one arm's reach.
+
+```bash
+python tools/fake_table_publisher.py --port 9036
+python -u robot_receiver.py --sim toyblocks --live --host 127.0.0.1 --port 9036
+```
+
+It exits 0 when every step is confirmed and 1 on a step timeout.
+
+## ToyBlocks backend
+
+`toyblocks_backend/` drives [AllenAI ToyBlocks](https://github.com/allenai/ToyBlocks)
+(Isaac Sim 5.1, Isaac Lab, cuRobo) as a live receiver. It is pinned to ToyBlocks
+commit `931fd7aab1458fd58f4c23d810879ea4826b07d8`, because it relies on vecgen
+engine internals.
+
+**Requirements.** Linux with an NVIDIA GPU and driver 570 or newer, Python 3.11,
+and `uv`. ToyBlocks does not document Windows support. Run the receiver on the
+Linux machine and point it at the OpenUp PC: `--host <OpenUp PC LAN address>`
+(the OpenUp PC must allow inbound TCP 9036).
+
+```bash
+git clone https://github.com/allenai/ToyBlocks && cd ToyBlocks
+git checkout 931fd7aab1458fd58f4c23d810879ea4826b07d8 && git submodule update --init
+uv venv --python 3.11 && source .venv/bin/activate
+uv pip install -e ".[dev,isaac,torch-cu128,vecgen]"
+get-toyblocks-assets --asset-manifest asset_manifest.json
+export OMNI_KIT_ACCEPT_EULA=YES
+pytest tests/install --install-gpu
+```
+
+Then, from this repository with that environment active:
+
+```bash
+python -u toyblocks_backend/spike.py --headless          # Phase 0 gate: grasp, place, reach sweep
+python -u robot_receiver.py --sim toyblocks --live --host <OpenUp PC> --port 9036
+```
+
+**How it differs from Genesis.**
+
+- **One arm.** A single Franka sits at the middle of the rack edge
+  (`--robot-to-near-edge`, default 0.15 m). Targets it cannot reach stop the
+  session with `rejected: HALTED: No reachable robot transfer ...`, the same way
+  Genesis reports an unreachable transfer. `spike.py --sweep` writes the
+  reachable area to `outputs/toyblocks_reach.csv`.
+- **Staging beside the robot.** Supply and returned pieces use colour lanes on
+  two pads beside the robot base (`toyblocks_backend/staging.py`) instead of
+  strips beyond the table ends.
+- **Real fingers.** An 8 cm cube leaves about 2.5 mm per side in the 85 mm
+  Robotiq gripper, and the closed fingers stick out past the piece. The backend
+  approaches from above, lifts pieces clear of 8 cm neighbours, and turns cubes
+  (quarter turns) or bars (half turns) so the fingers avoid touching
+  neighbours. A piece with neighbours touching both sides it must be gripped
+  by may still fail to place.
+- **Real physics.** Pieces are grasped and released physically. A piece counts
+  as placed when it settles within 1 cm and 3 degrees of its target; the
+  receiver then reports the exact target so OpenUp's 1e-5 check confirms it. A
+  piece that does not stay put (an overhang, for example) is retried, then the
+  session halts with `unstable: ...`.
+- **Not supported yet:** `--record`, `--physical` (always physical), and
+  offline JSON replay.
 
 ## Connect the OpenUp Cube Stack table live
 

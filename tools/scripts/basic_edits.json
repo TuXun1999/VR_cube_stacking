@@ -1,0 +1,32 @@
+{
+  "description": "Add, stack, bar, move, delete and reset near the robot rack edge, inside a single arm's reach. Every layout is physically stable.",
+  "table": {"width": 1.21, "depth": 0.680625},
+  "cube_size": 0.08,
+  "steps": [
+    {"name": "add one red cube", "pieces": [
+      {"id": "r1", "color": "red", "x": 0.0, "z": -0.15}
+    ]},
+    {"name": "stack a green cube on it", "pieces": [
+      {"id": "r1", "color": "red", "x": 0.0, "z": -0.15},
+      {"id": "g1", "color": "green", "x": 0.0, "z": -0.15, "level": 1}
+    ]},
+    {"name": "add a yawed blue triple bar", "pieces": [
+      {"id": "r1", "color": "red", "x": 0.0, "z": -0.15},
+      {"id": "g1", "color": "green", "x": 0.0, "z": -0.15, "level": 1},
+      {"id": "b1", "color": "blue", "x": 0.22, "z": 0.0, "length": 3, "yaw_deg": 30}
+    ]},
+    {"name": "move the green cube down onto the table", "pieces": [
+      {"id": "r1", "color": "red", "x": 0.0, "z": -0.15},
+      {"id": "g1", "color": "green", "x": -0.16, "z": -0.12},
+      {"id": "b1", "color": "blue", "x": 0.22, "z": 0.0, "length": 3, "yaw_deg": 30}
+    ]},
+    {"name": "delete the bar", "pieces": [
+      {"id": "r1", "color": "red", "x": 0.0, "z": -0.15},
+      {"id": "g1", "color": "green", "x": -0.16, "z": -0.12}
+    ]},
+    {"name": "reset the session", "reset": true, "pieces": []},
+    {"name": "add after reset", "pieces": [
+      {"id": "r2", "color": "red", "x": 0.05, "z": -0.2}
+    ]}
+  ]
+}
