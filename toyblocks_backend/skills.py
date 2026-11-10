@@ -34,7 +34,7 @@ APPROACH_HEIGHT = 0.05  # planned approach ends this far above the grasp pose
 LIFT_HEIGHT = 0.15  # lift the piece clear of 8 cm neighbours before transport
 NEIGHBOUR_CLEARANCE = 0.10  # extra pre-place height, so transport ends above neighbours
 MIN_JAW_ALIGNMENT = 0.7  # |cos| between the jaw axis and the piece's short axis
-PLACE_VERIFY_TOLERANCE = 0.015  # metres; the receiver's 1 cm snap decides "done"
+PLACE_VERIFY_TOLERANCE = 0.03  # metres; entity.POSITION_TOLERANCE decides "done"
 
 
 def jaw_alignment(cands, block_pose, block_size):
@@ -98,7 +98,12 @@ class PickPiece(Pick):
         cands = grasp_candidates(blk, size, ee)  # [B, 4, 7]
         wide = size[:, :2].amax(dim=1) > MAX_JAW_OPENING
         allowed = (jaw_alignment(cands, blk, size) >= MIN_JAW_ALIGNMENT) | ~wide[:, None]
-        ctx.geo.update_worlds(ctx.block_poses(), ctx.table_pose(), env_ids=env_ids)
+        # The open fingers straddle the piece being picked (cuRobo's finger spheres
+        # overlap an 8 cm piece), so that piece is not an obstacle for these IK checks;
+        # the descend phase likewise excludes it.
+        held = torch.zeros(ctx.sim.num_envs, len(ctx.block_names), dtype=torch.bool, device=dev)
+        held[env_ids, j] = True
+        ctx.geo.update_worlds(ctx.block_poses(), ctx.table_pose(), exclude=held, env_ids=env_ids)
         ignore = (poses[:, :, :2] - blk[:, None, :2]).norm(dim=-1) < 0.6 * size[:, None, 0]
         clear = torch.full((b, 4), float("-inf"), device=dev)
         for c in range(4):

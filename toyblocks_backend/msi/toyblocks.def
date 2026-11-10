@@ -1,0 +1,21 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+# System libraries for ToyBlocks / Isaac Sim 5.1, taken from ToyBlocks'
+# docker/vecgen.dockerfile at the pinned commit, plus a compiler for cuRobo's
+# editable install. Python, Isaac Sim and ToyBlocks themselves are installed into
+# a venv on scratch by install_python.sh, so this image stays small (~230 MB).
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl git openssh-client jq build-essential \
+        libgl1 libegl1 libglu1-mesa libvulkan1 libglib2.0-0t64 libgomp1 \
+        libx11-6 libxext6 libxrender1 libxt6t64 libxrandr2 libxinerama1 libxcursor1 libxi6 \
+        libsm6 libice6 libxkbcommon0 iproute2 procps
+    rm -rf /var/lib/apt/lists/*
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+
+%environment
+    export UV_LINK_MODE=copy

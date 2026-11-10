@@ -23,6 +23,8 @@ def add_backend_arguments(parser):
                        help="accepted for compatibility with the Genesis flags; scales settle waits only")
     group.add_argument("--record", nargs="?", const="unsupported", metavar="PATH",
                        help="not supported by this backend yet")
+    group.add_argument("--viewer", action="store_true",
+                       help="serve ToyBlocks' browser 3D viewer (viser; port 8080 or the next free one)")
 
 
 def _check(args):
@@ -45,4 +47,4 @@ def build_backend(layout, args):
     from toyblocks_backend.live import ToyBlocksBackend
     return ToyBlocksBackend(layout, SimpleNamespace(
         live=True, pool_per_color=args.pool_per_color, speed=args.speed, physical=True,
-        robot_to_near_edge=args.robot_to_near_edge, device=args.device))
+        robot_to_near_edge=args.robot_to_near_edge, device=args.device, viewer=args.viewer))

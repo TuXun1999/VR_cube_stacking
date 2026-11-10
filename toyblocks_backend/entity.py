@@ -16,6 +16,16 @@ import torch
 
 from cube_stack_receiver import pose_within_tolerance
 
+# First runs on an A40 placed 8 cm cubes 1-10 mm from their targets, so ToyBlocks
+# uses a wider "placed" tolerance than the receiver's 1 cm / 3 degree default.
+POSITION_TOLERANCE = 0.02
+ANGLE_TOLERANCE_DEG = 5.0
+
+
+def _close(position, quaternion, target_position, target_quaternion, length):
+    return pose_within_tolerance(position, quaternion, target_position, target_quaternion, length,
+                                 POSITION_TOLERANCE, ANGLE_TOLERANCE_DEG)
+
 
 class LiveWorld:
     """What every entity needs: the vecgen sim and the planner/robot frame map."""
@@ -54,7 +64,7 @@ class ToyBlocksEntity:
 
     def _resolved(self):
         position, quaternion = self.measured()
-        if self.nominal is not None and pose_within_tolerance(position, quaternion, *self.nominal, self.length):
+        if self.nominal is not None and _close(position, quaternion, *self.nominal, self.length):
             return self.nominal
         return position, quaternion
 
@@ -77,7 +87,7 @@ class ToyBlocksEntity:
     def accept(self, position, quaternion):
         """Adopt a target as nominal if the body physically reached it; return whether it did."""
         measured_position, measured_quaternion = self.measured()
-        reached = pose_within_tolerance(measured_position, measured_quaternion, position, quaternion, self.length)
+        reached = _close(measured_position, measured_quaternion, position, quaternion, self.length)
         self.nominal = ((tuple(float(v) for v in position), tuple(float(v) for v in quaternion))
                         if reached else None)
         return reached

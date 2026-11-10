@@ -233,6 +233,12 @@ python -u toyblocks_backend/spike.py --headless          # Phase 0 gate: grasp, 
 python -u robot_receiver.py --sim toyblocks --live --host <OpenUp PC> --port 9036
 ```
 
+**Running it on MSI.** If you don't have a suitable Linux GPU machine, see
+[toyblocks_backend/msi/README.md](toyblocks_backend/msi/README.md). It covers an
+Apptainer image and scripts for MSI's Agate A40/L40S nodes, plus the SSH tunnel
+back to a Windows laptop running the desktop table. Add `--viewer` to serve
+ToyBlocks' browser 3D viewer (viser, port 8080), which needs no Isaac window.
+
 **How it differs from Genesis.**
 
 - **One arm.** A single Franka sits at the middle of the rack edge
@@ -250,8 +256,9 @@ python -u robot_receiver.py --sim toyblocks --live --host <OpenUp PC> --port 903
   neighbours. A piece with neighbours touching both sides it must be gripped
   by may still fail to place.
 - **Real physics.** Pieces are grasped and released physically. A piece counts
-  as placed when it settles within 1 cm and 3 degrees of its target; the
-  receiver then reports the exact target so OpenUp's 1e-5 check confirms it. A
+  as placed when it settles within 2 cm and 5 degrees of its target (widened
+  from 1 cm / 3 degrees after the first A40 run); the receiver then reports the
+  exact target so OpenUp's 1e-5 check confirms it. A
   piece that does not stay put (an overhang, for example) is retried, then the
   session halts with `unstable: ...`.
 - **Not supported yet:** `--record`, `--physical` (always physical), and

@@ -45,6 +45,7 @@ PARK_MAX_TICKS = 300
 IK_POSITION_TOLERANCE = 0.005  # Pick.begin's acceptance for a near-miss IK solution
 IK_ROTATION_TOLERANCE = 0.05
 PARKED_BELOW = -0.5  # planner z; pool bodies parked on the ground are not neighbours
+VIEWER_EVERY = 3  # control steps (0.04 s of sim time each) between browser-viewer updates
 
 
 class ToyBlocksBackend(LiveScenePlanner):
@@ -53,6 +54,8 @@ class ToyBlocksBackend(LiveScenePlanner):
     def __init__(self, layout, options):
         self.layout = layout
         self.options = options
+        self.viewer = None
+        self._viewer_ticks = 0
         self.clear_carried()
         self.live_client = self.live_queue = None
         self.placed_placements = []
@@ -83,6 +86,42 @@ class ToyBlocksBackend(LiveScenePlanner):
         self._corrections = Counter()
         self._setup_live_pool()
         self._initialize_poses()
+        if getattr(options, "viewer", False):
+            self._start_viewer(env.unwrapped)
+
+    # -- browser viewer (ToyBlocks' viser viewer; needs no Vulkan) -------------------------
+
+    def _start_viewer(self, base_env):
+        from toyblocks.viewer.viewer import Viewer, ViewerCfg
+
+        try:
+            self.viewer = Viewer(ViewerCfg(minimal_gui=True))
+            self.viewer.load_assets(base_env)
+        except Exception as error:  # the robot keeps working without a picture
+            print(f"viewer: unavailable ({error})", flush=True)
+            self.viewer = None
+            return
+        self._viewer_env = base_env
+        self._viewer_ids = torch.tensor([ENV], device=base_env.device, dtype=torch.int32)
+        port = self.viewer._server.get_port()
+        print(f"viewer: serving on port {port} ({self.viewer.get_server_url()})", flush=True)
+        self._refresh_viewer(force=True)
+
+    def _refresh_viewer(self, force=False):
+        if self.viewer is None:
+            return
+        self._viewer_ticks += 1
+        if not force and self._viewer_ticks % VIEWER_EVERY:
+            return
+        try:
+            frame = self.viewer._create_trajectory_frame_from_env(self._viewer_env, self._viewer_ids)
+            # view_frame skips a frame equal to the last one, but comparing two live Frames
+            # compares numpy arrays and raises; forget the last frame instead.
+            self.viewer._last_viewed_set = None
+            self.viewer.view_frame(frame, env_id=ENV)
+        except Exception as error:
+            print(f"viewer: stopped after an error ({error}); the robot carries on", flush=True)
+            self.viewer = None
 
     def _check_table_top(self):
         root = float(self.sim.object_pose("workspace_table")[ENV, 2])
@@ -100,6 +139,7 @@ class ToyBlocksBackend(LiveScenePlanner):
     # -- simulation hooks -----------------------------------------------------------------
 
     def _tick(self):
+        self._refresh_viewer()
         pump_and_check(self.live_client, self.live_queue)
 
     def _step(self):
@@ -122,6 +162,7 @@ class ToyBlocksBackend(LiveScenePlanner):
         self.sim.apply_profile(PROFILE, self._ids)
         self.geo.detach(self._ids)
         self.ctx.held[self._ids] = -1
+        self._refresh_viewer(force=True)
 
     def _start_recording(self):
         pass
